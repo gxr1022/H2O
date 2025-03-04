@@ -14,7 +14,8 @@ from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.models.gpt_neox.modeling_gpt_neox import RotaryEmbedding, GPTNeoXAttention, apply_rotary_pos_emb
-
+# from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXAttention, apply_rotary_pos_emb
+# from transformers.models.gpt_neox.modeling_gpt_neox_fast import RotaryEmbedding
 
 __all__ = ['convert_kvcache_gpt_neox_heavy_recent', 'GPTNeoXAttention_Mask']
 

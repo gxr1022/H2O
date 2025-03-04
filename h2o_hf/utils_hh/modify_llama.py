@@ -78,9 +78,11 @@ class LlamaAttention_heavy_hitter(nn.Module):
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+        # get the sequence length of the key states
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+        # the dimension of the value_states is [bsz, nh, t, hd], the same as the query_states and key_states, only the dimension information is used for rotary embedding
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
@@ -114,8 +116,6 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-
 
 
         # attn_weights (BS, heads, q-tokens, k-tokens) 16, 15, 15 // 16, 1, 16
