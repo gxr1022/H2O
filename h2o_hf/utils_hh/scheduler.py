@@ -1,18 +1,14 @@
-from h2o_hf.utils_hh.prefix_cache import SessionKVCache, CacheEngine, CacheConfig
-from h2o_hf.utils_hh.llama import LlamaForCausalLM
+from utils_hh.prefix_cache import SessionKVCache, CacheEngine, CacheConfig
+from utils_hh.llama import LlamaForCausalLM
 import torch
 from typing import Optional, List   
 from torch.nn.utils.rnn import pad_sequence
-
-
-
-
 
 class PrefixCacheScheduler:
     def __init__(self, model: LlamaForCausalLM, cache_config: CacheConfig):
         self.model = model
         self.session_kv_cache = SessionKVCache(cache_config, model.config)
-        self.cache_engine = CacheEngine(cache_config, model.config)
+        # self.cache_engine = model.cache_engine
         self.cache_config = cache_config
 
     def generate(
@@ -29,10 +25,13 @@ class PrefixCacheScheduler:
             new_input_ids_list = []
             prefix_cache_block_ids_list = []
             prefix_lengths_list = []
-        
+
             for batch_idx in range(batch_size):
                 sequence = input_ids[batch_idx]  
-                matching_session = self.session_kv_cache.find_matching_session(sequence.tolist())
+                if self.session_kv_cache.sessions:
+                    matching_session = self.session_kv_cache.find_matching_session(sequence.tolist())
+                else:
+                    matching_session = self.session_kv_cache.create_new_session(sequence.tolist(), []) 
                 
                 if matching_session:
                     cached_blocks = matching_session.block_ids
@@ -68,11 +67,15 @@ class PrefixCacheScheduler:
                 new_kv_cache_positions.append((block_id, offset))
             else:
                 new_kv_cache_positions.append(None)
-                
-        generate_ids = model.generate(input_ids, max_new_tokens=1024, use_cache=False, 
-                                      attention_mask=new_attention_mask, 
-                                      prefix_cached_block_ids=prefix_cache_block_ids_list,
-                                      new_kv_cache_positions=new_kv_cache_positions)
+        
+        generate_kwargs = {
+        "max_new_tokens": 1024,
+        "use_cache": True,
+        "prefix_cache_block_ids_list": prefix_cache_block_ids_list,
+        "new_kv_cache_positions": new_kv_cache_positions,
+        "prefix_lengths_list": prefix_lengths_list
+    }    
+        generate_ids = model.generate(input_ids, **generate_kwargs)
         result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         
      

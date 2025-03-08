@@ -28,8 +28,8 @@ import tqdm
 import copy 
 
 from utils_hh.scheduler import PrefixCacheScheduler
-from utils_hh.prefix_cache import CacheConfig
-
+from utils_hh.prefix_cache import CacheConfig, CacheEngine
+import torch.nn.functional as F
 
 from transformers import (
     CTRLLMHeadModel,
@@ -51,7 +51,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from utils_hh.modify_llama import convert_kvcache_llama_heavy_recent, LlamaAttention_heavy_hitter
 # from utils_hh.modify_gptneox import convert_kvcache_gpt_neox_heavy_recent, GPTNeoXAttention_Mask
 from utils_hh.modify_opt import convert_kvcache_opt_heavy_recent, OPTAttention_Mask
-
+from utils_hh.scheduler import PrefixCacheScheduler
+from utils_hh.llama import MyLlamaForCausalLM
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -118,16 +119,19 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
     conversation_id = '1jjEIai'
     conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
     prompt_text = ''
-    model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
-    model.half().eval().cuda()
+    # model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
+    
    
     cache_config = CacheConfig(
         block_size=1024,
         gpu_memory_utilization=0.9,
-        cache_dtype='fp16',
+        cache_dtype="float16",
         enable_prefix_caching=True
     )
-
+    
+    model = MyLlamaForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, cache_config=cache_config)
+    model.half().eval().cuda()
+    
     scheduler = PrefixCacheScheduler(model, cache_config)
     
     for i in range(0,num_turns,2):
@@ -135,7 +139,7 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
         
         input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
 
-        result = scheduler.generate(input_ids, max_new_tokens=length)
+        result = scheduler.generate(model, tokenizer, input_ids, max_new_tokens=length)
 
         # generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)
         # result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
@@ -242,12 +246,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, cache_dir=args.cache_dir)
 
     ######## Generate with Full Cache
-    result = full_cache_generation_with_gpt_resp(model_name, args.cache_dir, tokenizer, args.length)
+    result = full_cache_generation(model_name, args.cache_dir, tokenizer, args.length)
     print(result)
     
     ######### Enable HH
-    heavy_hitter_result = heavy_hitter_generation_with_gpt_resp(model_name, args.model_arch, args.cache_dir, tokenizer, args.length, config)
-    print(heavy_hitter_result)
+    # heavy_hitter_result = heavy_hitter_generation_with_gpt_resp(model_name, args.model_arch, args.cache_dir, tokenizer, args.length, config)
+    # print(heavy_hitter_result)
   
 
 

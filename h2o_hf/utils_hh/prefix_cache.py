@@ -4,7 +4,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from typing import List, Any, Optional, Union, Tuple
 import numpy as np
 import hashlib
-from utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+from utils_hh.utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
 
 
@@ -76,19 +76,23 @@ class CacheConfig:
                 "GPU memory utilization must be less than 1.0."
                 f"{self.gpu_memory_utilization}.")
 
-    def _verify_cache_dtype(self) -> None:
-        if self.cache_dtype == "auto":
-            pass
-        elif self.cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
-            print(
-                "Using fp8 data type to store kv cache. It reduces the GPU "
-                "memory footprint and boosts the performance. "
-                "Meanwhile, it may cause accuracy drop without a proper "
-                "scaling factor")
-        else:
-            raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}")
-    
-      
+    # def _verify_cache_dtype(self) -> None:
+    #     if self.cache_dtype == "auto":
+    #         pass
+    #     elif self.cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+    #         print(
+    #             "Using fp8 data type to store kv cache. It reduces the GPU "
+    #             "memory footprint and boosts the performance. "
+    #             "Meanwhile, it may cause accuracy drop without a proper "
+    #             "scaling factor")
+    #     else:
+    #         raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}")
+
+    def _verify_cache_dtype(self):
+        valid_dtypes = ["float16", "float32", torch.float16, torch.float32]
+        if self.cache_dtype not in valid_dtypes:
+            raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}. Must be one of {valid_dtypes}") 
+        
 
 class CacheEngine:
     """Manages the KV cache.
@@ -117,7 +121,7 @@ class CacheEngine:
             self.num_gpu_blocks = self.determine_num_available_blocks()
         
         # self.num_cpu_blocks = cache_config.num_cpu_blocks
-
+        print('hi',self.num_gpu_blocks)
 
         if cache_config.cache_dtype == "auto":
             self.dtype = Union[str, torch.dtype] 
@@ -141,6 +145,7 @@ class CacheEngine:
 
         """Allocates KV cache on the specified device."""
         kv_cache_shape = (2,num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+        print(kv_cache_shape)
         kv_cache: List[torch.Tensor] = []
 
         alloc_shape = kv_cache_shape
@@ -184,9 +189,10 @@ class CacheEngine:
         cache_block_size = self.get_cache_block_size_bytes(self.cache_config, self.model_config)
         self.num_gpu_blocks = int(available_kv_cache_memory // cache_block_size)
         # self.num_cpu_blocks = int(self.cache_config.swap_space_bytes // cache_block_size)
-
+        return self.num_gpu_blocks
 
     def get_cache_block_size_bytes(
+        self,
         cache_config: CacheConfig,
         model_config: LlamaConfig,
     ) -> int:
@@ -398,30 +404,30 @@ class SessionKVCache:
     #     return kv_caches
 
 
-    # def cleanup_old_sessions(self, max_sessions: int = 1000):
-    #     """Clean up old sessions (when session count exceeds limit)"""
-    #     if len(self.sessions) <= max_sessions:
-    #         return
+    def cleanup_old_sessions(self, max_sessions: int = 1000):
+        """Clean up old sessions (when session count exceeds limit)"""
+        if len(self.sessions) <= max_sessions:
+            return
             
-    #     # Sort by last used time
-    #     sorted_sessions = sorted(
-    #         self.sessions.items(), 
-    #         key=lambda x: x[1].last_used
-    #     )
+        # Sort by last used time
+        sorted_sessions = sorted(
+            self.sessions.items(), 
+            key=lambda x: x[1].last_used
+        )
         
-    #     # Remove oldest sessions
-    #     sessions_to_remove = sorted_sessions[:-max_sessions]
-    #     for session_id, session in sessions_to_remove:
-    #         self._remove_session(session_id)
+        # Remove oldest sessions
+        sessions_to_remove = sorted_sessions[:-max_sessions]
+        for session_id, session in sessions_to_remove:
+            self._remove_session(session_id)
 
-    # def _remove_session(self, session_id: int):
-    #     """Remove specified session"""
-    #     session = self.sessions[session_id]
-    #     # Clear indices
-    #     for prefix_hash, sessions in self.session_index.items():
-    #         if session_id in sessions:
-    #             sessions.remove(session_id)
-    #     # Delete session
-    #     del self.sessions[session_id]
+    def _remove_session(self, session_id: int):
+        """Remove specified session"""
+        session = self.sessions[session_id]
+        # Clear indices
+        for prefix_hash, sessions in self.session_index.items():
+            if session_id in sessions:
+                sessions.remove(session_id)
+        # Delete session
+        del self.sessions[session_id]
 
  
