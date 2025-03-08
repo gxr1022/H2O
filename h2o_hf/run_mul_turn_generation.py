@@ -27,6 +27,10 @@ import json
 import tqdm 
 import copy 
 
+from utils_hh.scheduler import PrefixCacheScheduler
+from utils_hh.prefix_cache import CacheConfig
+
+
 from transformers import (
     CTRLLMHeadModel,
     CTRLTokenizer,
@@ -66,20 +70,6 @@ MODEL_CLASSES = {
     "transfo-xl": (TransfoXLLMHeadModel, TransfoXLTokenizer),
     "xlm": (XLMWithLMHeadModel, XLMTokenizer),
 }
-
-# Padding text to help Transformer-XL and XLNet with short prompts as proposed by Aman Rusia
-# in https://github.com/rusiaaman/XLNet-gen#methodology
-# and https://medium.com/@amanrusia/xlnet-speaks-comparison-to-gpt-2-ea1a4e9ba39e
-PREFIX = """In 1991, the remains of Russian Tsar Nicholas II and his family
-(except for Alexei and Maria) are discovered.
-The voice of Nicholas's young son, Tsarevich Alexei Nikolaevich, narrates the
-remainder of the story. 1883 Western Siberia,
-a young Grigori Rasputin is asked by his father and a group of men to perform magic.
-Rasputin has a vision and denounces one of the men as a horse thief. Although his
-father initially slaps him for making such an accusation, Rasputin watches as the
-man is chased outside and beaten. Twenty years later, Rasputin sees a vision of
-the Virgin Mary, prompting him to become a priest. Rasputin quickly becomes famous,
-with people, even a bishop, begging for his blessing. <eod> </s> <eos>"""
 
 
 def set_seed(args):
@@ -128,16 +118,27 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
     conversation_id = '1jjEIai'
     conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
     prompt_text = ''
+    model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
+    model.half().eval().cuda()
+   
+    cache_config = CacheConfig(
+        block_size=1024,
+        gpu_memory_utilization=0.9,
+        cache_dtype='fp16',
+        enable_prefix_caching=True
+    )
+
+    scheduler = PrefixCacheScheduler(model, cache_config)
+    
     for i in range(0,num_turns,2):
         prompt_text += format_conversation(conversations, i)
         
-        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
-        model.half().eval().cuda()
         input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
 
-        generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)
-        result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        # print("################## Generated Context with Full Cache ###################")
+        result = scheduler.generate(input_ids, max_new_tokens=length)
+
+        # generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)
+        # result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         print(result,'\n')
         prompt_text += result
 

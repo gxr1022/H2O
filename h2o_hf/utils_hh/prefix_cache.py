@@ -44,7 +44,7 @@ class CacheConfig:
         self,
         block_size: int,
         gpu_memory_utilization: float,
-        swap_space: float,
+        # swap_space: float,
         cache_dtype: str,
         num_gpu_blocks_override: Optional[int] = None,
         enable_prefix_caching: bool = False,
@@ -52,7 +52,7 @@ class CacheConfig:
         self.block_size = block_size
         # default 0.9
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.swap_space_bytes = swap_space * 1024 * 1024 * 1024
+        # self.swap_space_bytes = swap_space * 1024 * 1024 * 1024
         self.cache_dtype = cache_dtype
         self.num_gpu_blocks_override = num_gpu_blocks_override
         self.enable_prefix_caching = enable_prefix_caching
@@ -203,94 +203,116 @@ class CacheEngine:
         value_cache_entry = key_cache_entry 
 
         # ?? Why num_attention_layers need to be multiplied?
-        total = num_attention_layers * cache_config.block_size * \
-            (key_cache_entry + value_cache_entry)
+        total = num_attention_layers * cache_config.block_size * (key_cache_entry + value_cache_entry)
 
         dtype_size = get_dtype_size(dtype)
         return dtype_size * total
 
+    # def get_cached_kvs(self, block_ids: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def append_kv(self, block_id:int, offset:int, layer_idx:int, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        if offset >= self.block_size:
+            block_id += 1
+            offset = 0
+            new_allocated_blocks = 1
+        else:
+            new_allocated_blocks = 0
+        self.gpu_cache[layer_idx][0, block_id, offset, :, :] = key_states
+        self.gpu_cache[layer_idx][1, block_id, offset, :, :] = value_states
+        return new_allocated_blocks
+        
+    def get_cached_kv(self, block_ids: List[int], layer_idx: int, offset: int, key:int):
+        if not block_ids:
+            return None
+        
+        total_len = (len(block_ids) - 1) * self.block_size + offset
+        
+        # 使用index_select一次性选择所需的数据
+        indices = torch.arange(
+            block_ids[0] * self.block_size,
+            (block_ids[-1]) * self.block_size + offset,
+            device=self.gpu_cache[layer_idx].device
+        )
+        return self.gpu_cache[layer_idx][key].reshape(-1, self.num_heads, self.head_dim)[indices].reshape(1, -1, self.num_heads, self.head_dim)
+    
+
+# class TokenIdCache:
+
+#     """
+#     Args:
+#         prev_block (Block): The previous block in the sequence.
+#         token_ids (List[int]): The initial token IDs to be stored in the block.
+#         block_size (int): The maximum number of token IDs that can be stored in
+#             the block.
+#         allocator (BlockAllocator): The block allocator associated with this
+#             block.
+#         block_id (Optional[int], optional): The physical block index
+#             of this block. Defaults to None, which means no allocation has been
+#             made.
+#     """
 
 
-
-
-
-class TokenIdCache:
-
-    """
-    Args:
-        prev_block (Block): The previous block in the sequence.
-        token_ids (List[int]): The initial token IDs to be stored in the block.
-        block_size (int): The maximum number of token IDs that can be stored in
-            the block.
-        allocator (BlockAllocator): The block allocator associated with this
-            block.
-        block_id (Optional[int], optional): The physical block index
-            of this block. Defaults to None, which means no allocation has been
-            made.
-    """
-
-
-    def __init__(self, cache_config: CacheConfig, model_config: LlamaConfig):
-        self.cache_config = cache_config
-        self.model_config = model_config
+#     def __init__(self, cache_config: CacheConfig, model_config: LlamaConfig):
+#         self.cache_config = cache_config
+#         self.model_config = model_config
    
-    def __init__(self,
-                 prev_block: Optional[Block],
-                 token_ids: List[int],
-                 block_size: int,
-                 allocator: BlockAllocator,
-                 block_id: Optional[int] = None,
-                 extra_hash: Optional[int] = None):
-        self._token_ids: List[int] = []
-        self._block_size = block_size
-        self._prev_block = prev_block
-        self._block_id = block_id
-        self._allocator = allocator
-        self._append_token_ids(token_ids)
+#     def __init__(self,
+#                  prev_block: Optional[Block],
+#                  token_ids: List[int],
+#                  block_size: int,
+#                  allocator: BlockAllocator,
+#                  block_id: Optional[int] = None,
+#                  extra_hash: Optional[int] = None):
+#         self._token_ids: List[int] = []
+#         self._block_size = block_size
+#         self._prev_block = prev_block
+#         self._block_id = block_id
+#         self._allocator = allocator
+#         self._append_token_ids(token_ids)
 
-    def _append_token_ids(self, token_ids: List[int]) -> None:
-        """Appends the given token IDs to the block
-        Args:
-            token_ids (List[int]): The token IDs to be appended to the block.
-        """
-        if len(token_ids) == 0:
-            return
+#     def _append_token_ids(self, token_ids: List[int]) -> None:
+#         """Appends the given token IDs to the block
+#         Args:
+#             token_ids (List[int]): The token IDs to be appended to the block.
+#         """
+#         if len(token_ids) == 0:
+#             return
 
-        assert len(token_ids) <= self.num_empty_slots
+#         assert len(token_ids) <= self.num_empty_slots
 
-        self._token_ids.extend(token_ids)
+#         self._token_ids.extend(token_ids)
 
-    @property
-    def block_id(self) -> Optional[int]:
-        return self._block_id
+#     @property
+#     def block_id(self) -> Optional[int]:
+#         return self._block_id
 
-    def block_id(self, value: Optional[int]) -> None:
-        self._block_id = value
+#     def block_id(self, value: Optional[int]) -> None:
+#         self._block_id = value
 
-    @property
-    def is_full(self) -> bool:
-        return self.num_empty_slots == 0
+#     @property
+#     def is_full(self) -> bool:
+#         return self.num_empty_slots == 0
 
-    @property
-    def num_empty_slots(self) -> int:
-        return self._block_size - len(self.token_ids)
+#     @property
+#     def num_empty_slots(self) -> int:
+#         return self._block_size - len(self.token_ids)
 
-    @property
-    def token_ids(self) -> List[int]:
-        return self._token_ids
+#     @property
+#     def token_ids(self) -> List[int]:
+#         return self._token_ids
 
-    @property
-    def num_tokens_total(self) -> int:
-        raise NotImplementedError(
-            "num_tokens_total is not used for naive block")
+#     @property
+#     def num_tokens_total(self) -> int:
+#         raise NotImplementedError(
+#             "num_tokens_total is not used for naive block")
 
-    @property
-    def block_size(self) -> int:
-        return self._block_size
+#     @property
+#     def block_size(self) -> int:
+#         return self._block_size
 
-    @property
-    def prev_block(self) -> Optional["Block"]:
-        return self._prev_block
+#     @property
+#     def prev_block(self) -> Optional["Block"]:
+#         return self._prev_block
 
 
 
@@ -328,13 +350,14 @@ class SessionInfo:
 
 class SessionKVCache:
     def __init__(self, cache_config: CacheConfig, model_config: LlamaConfig):
-        self.cache_engine = CacheEngine(cache_config, model_config)
+        # self.cache_engine = CacheEngine(cache_config, model_config)
         self.sessions: List[SessionInfo] = [] 
 
     def find_matching_session(self, token_ids: List[int]) -> Optional[SessionInfo]:
         """Find matching session"""
         candidate_sessions = set()
-        
+        if len(self.sessions) == 0:
+            return None
         # Filter sessions by hash matching
         for session in self.sessions:
             if session.matches_prefix(token_ids):
