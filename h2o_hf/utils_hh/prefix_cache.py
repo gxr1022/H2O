@@ -121,7 +121,6 @@ class CacheEngine:
             self.num_gpu_blocks = self.determine_num_available_blocks()
         
         # self.num_cpu_blocks = cache_config.num_cpu_blocks
-        print('hi',self.num_gpu_blocks)
 
         if cache_config.cache_dtype == "auto":
             self.dtype = Union[str, torch.dtype] 
@@ -130,7 +129,7 @@ class CacheEngine:
 
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
-            self.num_gpu_blocks, "cuda:0")
+            self.num_gpu_blocks, torch.device("cuda:1"))
         # self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
 
     '''
@@ -140,12 +139,12 @@ class CacheEngine:
     def _allocate_kv_cache(
         self,
         num_blocks: int,
-        device: str,
+        device: torch.device,
     ) -> List[torch.Tensor]:
 
         """Allocates KV cache on the specified device."""
         kv_cache_shape = (2,num_blocks, self.block_size, self.num_kv_heads, self.head_size)
-        print(kv_cache_shape)
+        print("CacheEngine:_allocate_kv_cache",kv_cache_shape)
         kv_cache: List[torch.Tensor] = []
 
         alloc_shape = kv_cache_shape

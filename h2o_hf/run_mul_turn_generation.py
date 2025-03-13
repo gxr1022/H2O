@@ -129,7 +129,7 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
         enable_prefix_caching=True
     )
     
-    model = MyLlamaForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, cache_config=cache_config)
+    model = MyLlamaForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
     model.half().eval().cuda()
     
     scheduler = PrefixCacheScheduler(model, cache_config)
@@ -139,6 +139,7 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
         
         input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
 
+        print("full_cache_generation",input_ids,'\n')
         result = scheduler.generate(model, tokenizer, input_ids, max_new_tokens=length)
 
         # generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)
@@ -167,7 +168,7 @@ def  full_cache_generation_with_gpt_resp(model_name, cache_dir, tokenizer, lengt
     return prompt_text
 
 def  heavy_hitter_generation_with_gpt_resp(model_name,model_arch, cache_dir, tokenizer, length,config):
-    conversation_id = '1jjEIai'
+    conversation_id = 'xHQuqzG'
     conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
     prompt_text = ''
     for i in range(0,num_turns,2):

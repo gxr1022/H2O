@@ -9,6 +9,8 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoConfig
+
 
 from utils_hh.prefix_cache import CacheConfig, SessionKVCache, SessionInfo, CacheEngine
 
@@ -58,28 +60,32 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
+        
+        print("LlamaAttention:forward",input_shape)
+        
         # （bsz, seq_len, num_heads, head_dim）
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         # append KV to prefix cache.
-        if prefix_cache_block_ids_list is not None:
-            batch_size = len(prefix_cache_block_ids_list)
-            for b in range(batch_size):
-                if new_kv_cache_positions[b] is not None:
-                    block_id, offset = new_kv_cache_positions[b]
-                    new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
-                    if new_allocated_block == 1:
-                        new_kv_cache_positions[b] = (block_id + 1, 0)
-                        prefix_cache_block_ids_list[b].append(block_id + 1)
-                    else:
-                        new_kv_cache_positions[b].offset += 1
-                prefix_lengths_list[b] = prefix_lengths_list[b] + 1
-                print(prefix_lengths_list)
-                
-        assert batch_size == 1
+        # if prefix_cache_block_ids_list is not None:
+        batch_size = len(prefix_cache_block_ids_list)
+        for b in range(batch_size):
+            if new_kv_cache_positions[b] is not None:
+                block_id, offset = new_kv_cache_positions[b]
+                new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
+                if new_allocated_block == 1:
+                    new_kv_cache_positions[b] = (block_id + 1, 0)
+                    prefix_cache_block_ids_list[b].append(block_id + 1)
+                else:
+                    new_kv_cache_positions[b].offset += 1
+            
+            prefix_lengths_list[b] = prefix_lengths_list[b] + 1
+            print("prefix_lengths_list",prefix_lengths_list)
+            
+        print("new_kv_cache_positions",new_kv_cache_positions)
+        # assert batch_size == 1
         key_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 0)
         value_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 1)
                   
@@ -141,7 +147,7 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs ,
+        **kwargs 
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
@@ -300,7 +306,8 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs 
+        **kwargs
+         
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -345,7 +352,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
         hidden_states = inputs_embeds
-
+        print("hidden_states:",hidden_states,'\n')
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -354,7 +361,6 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -385,6 +391,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings=position_embeddings,
                     **kwargs
                 )
+                print("LlamaModel:forward",prefix_cache_block_ids_list,'\n')
 
             hidden_states = layer_outputs[0]
 
@@ -426,14 +433,14 @@ class LlamaModel(LlamaPreTrainedModel):
         # using_static_cache = isinstance(past_key_values, StaticCache)
 
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                is_training=self.training,
-            ):
-                return None
+        # if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
+        #     if AttentionMaskConverter._ignore_causal_mask_sdpa(
+        #         attention_mask,
+        #         inputs_embeds=input_tensor,
+        #         past_key_values_length=past_seen_tokens,
+        #         is_training=self.training,
+        #     ):
+        #         return None
 
         dtype, device = input_tensor.dtype, input_tensor.device
         sequence_length = input_tensor.shape[1]
@@ -529,24 +536,22 @@ class LlamaModel(LlamaPreTrainedModel):
 
         return causal_mask
 
-
-
-
 class LlamaForCausalLM(LlamaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, cache_config: CacheConfig=None, cache_engine: CacheEngine=None):
+    def __init__(self, config, cache_engine: CacheEngine=None):
         super().__init__(config)
         
-        if cache_config is None:
-            cache_config = CacheConfig(
-                block_size=1024,
-                gpu_memory_utilization=0.9,
+        cache_config = CacheConfig(
+                block_size=16,
+                gpu_memory_utilization=0.5,
                 cache_dtype="float16",
                 enable_prefix_caching=True,
             )
         if cache_engine is None:
             cache_engine = CacheEngine(cache_config, config)
+
+        self.cache_engine = cache_engine
 
         self.model = LlamaModel(config, cache_engine)
         self.pretraining_tp = config.pretraining_tp
@@ -632,9 +637,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            prefix_cache_block_ids_list=prefix_cache_block_ids_list,
-            new_kv_cache_positions=new_kv_cache_positions,
-            prefix_lengths_list=prefix_lengths_list,
+            prefix_cache_block_ids_list=self._my_custom_prefix_args['prefix_cache_block_ids_list'],
+            new_kv_cache_positions=self._my_custom_prefix_args['new_kv_cache_positions'],
+            prefix_lengths_list=self._my_custom_prefix_args['prefix_lengths_list'],
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -679,9 +684,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             attentions=outputs.attentions,
         )
     def _get_model_forward_keys(self) -> set:
-        # 先获取父类基于 forward 签名推断的参数名集合
         forward_keys = super()._get_model_forward_keys()
-        # 将自定义的键加入集合
         forward_keys.update({
             "prefix_cache_block_ids_list",
             "new_kv_cache_positions",
@@ -728,49 +731,65 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
        return 
 
     def generate(self, input_ids, **generate_kwargs):
-        prefix_args = {}
-        prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list"]
-        for k in prefix_keys:
-            if k in generate_kwargs:
-                prefix_args[k] = generate_kwargs.pop(k)
+        # prefix_args = {}
+        # prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list"]
+        # for k in prefix_keys:
+        #     if k in generate_kwargs:
+        #         prefix_args[k] = generate_kwargs.pop(k)
 
         
-        self._my_custom_prefix_args = prefix_args
-
+        # self._my_custom_prefix_args = prefix_args
+        print("LlamaForCausalLM:generate",self._my_custom_prefix_args,'\n')
         return super().generate(input_ids, **generate_kwargs)
     
+class MyLlamaForCausalLM(LlamaForCausalLM):  
+    """
+    1. 继承 LlamaForCausalLM，但让 inner_model 处理 `_validate_model_kwargs`
+    2. 确保 super().__init__() 先执行，再赋值 inner_model
+    """
 
-class MyLlamaForCausalLM(LlamaForCausalLM):
-    
     def __init__(self, llama_inner_model: LlamaForCausalLM):
-        # 这个内部真正干活的是 LlamaForCausalLM
+        """
+        初始化时，先调用 super().__init__()，然后再赋值 inner_model。
+        """
+        super().__init__(llama_inner_model.config)
+
         self.inner_model = llama_inner_model
+        self.cache_engine = llama_inner_model.cache_engine
 
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
         *model_args,
-        cache_config=None,
         cache_engine=None,
         **kwargs
     ):
-        # 用 LlamaForCausalLM 的 from_pretrained 加载
-        # 这行因为 LlamaForCausalLM 现在不再强制需要 cache_config, cache_engine 了
+        """
+        1. 先用 LlamaForCausalLM 加载模型
+        2. 确保 `cache_config` 和 `cache_engine` 被正确传递
+        3. 包装成 `MyLlamaForCausalLM` 以处理 `_validate_model_kwargs`
+        """
+
+
+        # 先用 LlamaForCausalLM 的 from_pretrained 加载模型
         llama_model = LlamaForCausalLM.from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
-            cache_config=cache_config,  # 如果 None，也OK
             cache_engine=cache_engine,
             **kwargs
         )
-        # 再用包装类包装一下
+
+        # 再用 MyLlamaForCausalLM 进行包装
         new_obj = cls(llama_inner_model=llama_model)
 
-        # 这里如果你有更多 `_validate_model_kwargs` 相关的东西，也可以放在 new_obj 里
         return new_obj    
-    
+
     def generate(self, input_ids, **generate_kwargs):
+        """
+        1. 先剥离 `prefix_cache_block_ids_list` 等参数，存储到 self._my_custom_prefix_args
+        2. 调用 `super().generate(...)` 来执行生成逻辑
+        """
         prefix_args = {}
         prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list"]
         for k in prefix_keys:
@@ -778,19 +797,32 @@ class MyLlamaForCausalLM(LlamaForCausalLM):
                 prefix_args[k] = generate_kwargs.pop(k)
 
         self._my_custom_prefix_args = prefix_args
-
-
-        return super().generate(input_ids, **generate_kwargs)
+        print("MyLlamaForCausalLM:generate",prefix_args,'\n')
+        
+        self.inner_model._my_custom_prefix_args = prefix_args
+        
+        return self.inner_model.generate(input_ids, **generate_kwargs)
 
     def _validate_model_kwargs(self, model_kwargs):
-        super()._validate_model_kwargs(model_kwargs)
+        """
+        由于 Transformers 的 `_validate_model_kwargs` 不识别 `prefix_cache_block_ids_list`
+        这里手动 pop 掉
+        """
+        prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list"]
+        for k in prefix_keys:
+            model_kwargs.pop(k, None)
+
+        # ✅ 调用 inner_model 的 `_validate_model_kwargs` 进行检查
+        self.inner_model._validate_model_kwargs(model_kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        model_inputs = super().prepare_inputs_for_generation(input_ids, **kwargs)
+        """
+        确保在 `prepare_inputs_for_generation` 里能够正确注入自定义前缀缓存参数
+        """
+        model_inputs = self.inner_model.prepare_inputs_for_generation(input_ids, **kwargs)
 
         if hasattr(self, "_my_custom_prefix_args"):
             for k, v in self._my_custom_prefix_args.items():
                 model_inputs[k] = v
 
         return model_inputs
-

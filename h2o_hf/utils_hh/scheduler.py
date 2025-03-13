@@ -18,35 +18,34 @@ class PrefixCacheScheduler:
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         **generate_kwargs
-    ):
+    ):  
         # match prefix cache
         batch_size = input_ids.shape[0]
         if self.cache_config and self.cache_config.enable_prefix_caching:
             new_input_ids_list = []
-            prefix_cache_block_ids_list = []
-            prefix_lengths_list = []
+            prefix_cache_block_ids_list = [[] for _ in range(batch_size)]
+            prefix_lengths_list = [0 for _ in range(batch_size)] 
 
             for batch_idx in range(batch_size):
                 sequence = input_ids[batch_idx]  
-                if self.session_kv_cache.sessions:
+                if self.session_kv_cache.sessions != []:
                     matching_session = self.session_kv_cache.find_matching_session(sequence.tolist())
+                    if matching_session:
+                        cached_blocks = matching_session.block_ids
+                        prefix_cache_block_ids_list[batch_idx] = cached_blocks
+                        match_length = matching_session.compute_match_length(sequence.tolist())
+                        new_tokens = sequence[match_length:]
+                        prefix_lengths_list[batch_idx] = match_length
+                    else:
+                        new_tokens = sequence 
+                        # prefix_cache_block_ids_list[batch_idx] = []
+                        prefix_lengths_list[batch_idx] = 0
+
+                    new_input_ids_list.append(new_tokens)
+                    input_ids = pad_sequence(new_input_ids_list, batch_first=True, padding_value=0)
                 else:
                     matching_session = self.session_kv_cache.create_new_session(sequence.tolist(), []) 
                 
-                if matching_session:
-                    cached_blocks = matching_session.block_ids
-                    prefix_cache_block_ids_list.append(cached_blocks)
-                    match_length = matching_session.compute_match_length(sequence.tolist())
-
-                    new_tokens = sequence[match_length:]
-                    prefix_lengths_list.append(match_length)
-                else:
-                    new_tokens = sequence 
-                    prefix_cache_block_ids_list.append(None)
-                    prefix_lengths_list.append(None)
-                new_input_ids_list.append(new_tokens)
-
-            input_ids = pad_sequence(new_input_ids_list, batch_first=True, padding_value=0)
         
         # deal with attention mask
         if attention_mask is not None:
@@ -59,18 +58,23 @@ class PrefixCacheScheduler:
             new_attention_mask = None
         
         # calculated new KV cache positions 
-        new_kv_cache_positions = []
+        new_kv_cache_positions = [None for _ in range(batch_size)]
+       
+
         for b in range(batch_size):
-            if prefix_cache_block_ids_list[b] is not None:
+            if prefix_cache_block_ids_list[b] != []:
                 block_id = prefix_lengths_list[b] // self.cache_config.block_size
                 offset = prefix_lengths_list[b] % self.cache_config.block_size
-                new_kv_cache_positions.append((block_id, offset))
+                new_kv_cache_positions[b] = (block_id, offset)
             else:
-                new_kv_cache_positions.append(None)
-        
+                new_kv_cache_positions[b] = (0,0)
+   
+        print("new_kv_cache_positions:",new_kv_cache_positions,'\n')
+        print("prefix_cache_block_ids_list:",prefix_cache_block_ids_list,'\n')
+         
         generate_kwargs = {
         "max_new_tokens": 1024,
-        "use_cache": True,
+        "use_cache": False,
         "prefix_cache_block_ids_list": prefix_cache_block_ids_list,
         "new_kv_cache_positions": new_kv_cache_positions,
         "prefix_lengths_list": prefix_lengths_list
