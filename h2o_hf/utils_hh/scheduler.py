@@ -25,7 +25,7 @@ class PrefixCacheScheduler:
             new_input_ids_list = []
             prefix_cache_block_ids_list = [[] for _ in range(batch_size)]
             prefix_lengths_list = [0 for _ in range(batch_size)] 
-
+            print("prefix_lengths_list",prefix_lengths_list)
             for batch_idx in range(batch_size):
                 sequence = input_ids[batch_idx]  
                 if self.session_kv_cache.sessions != []:
@@ -35,6 +35,7 @@ class PrefixCacheScheduler:
                         prefix_cache_block_ids_list[batch_idx] = cached_blocks
                         match_length = matching_session.compute_match_length(sequence.tolist())
                         new_tokens = sequence[match_length:]
+                        print("match_length",match_length)
                         prefix_lengths_list[batch_idx] = match_length
                     else:
                         new_tokens = sequence 
@@ -73,7 +74,7 @@ class PrefixCacheScheduler:
         print("prefix_cache_block_ids_list:",prefix_cache_block_ids_list,'\n')
          
         generate_kwargs = {
-        "max_new_tokens": 1024,
+        "max_new_tokens": 128,
         "use_cache": False,
         "prefix_cache_block_ids_list": prefix_cache_block_ids_list,
         "new_kv_cache_positions": new_kv_cache_positions,

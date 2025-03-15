@@ -61,7 +61,7 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         
-        print("LlamaAttention:forward",input_shape)
+        # print("LlamaAttention:forward",input_shape)
         
         # （bsz, seq_len, num_heads, head_dim）
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -69,25 +69,24 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         # append KV to prefix cache.
-        # if prefix_cache_block_ids_list is not None:
-        batch_size = len(prefix_cache_block_ids_list)
-        for b in range(batch_size):
-            if new_kv_cache_positions[b] is not None:
-                block_id, offset = new_kv_cache_positions[b]
-                new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
-                if new_allocated_block == 1:
-                    new_kv_cache_positions[b] = (block_id + 1, 0)
-                    prefix_cache_block_ids_list[b].append(block_id + 1)
-                else:
-                    new_kv_cache_positions[b].offset += 1
+        # batch_size = len(prefix_cache_block_ids_list)
+        # for b in range(batch_size):
+        #     if new_kv_cache_positions[b] is not None:
+        #         block_id, offset = new_kv_cache_positions[b]
+        #         new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
+        #         if new_allocated_block == 1:
+        #             new_kv_cache_positions[b] = (block_id + 1, 0)
+        #             prefix_cache_block_ids_list[b].append(block_id + 1)
+        #         else:
+        #             new_kv_cache_positions[b].offset += 1
             
-            prefix_lengths_list[b] = prefix_lengths_list[b] + 1
-            print("prefix_lengths_list",prefix_lengths_list)
+        #     prefix_lengths_list[b] = prefix_lengths_list[b] + 1
+        #     print("prefix_lengths_list",prefix_lengths_list)
             
-        print("new_kv_cache_positions",new_kv_cache_positions)
-        # assert batch_size == 1
-        key_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 0)
-        value_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 1)
+        # print("new_kv_cache_positions",new_kv_cache_positions)
+        # # assert batch_size == 1
+        # key_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 0)
+        # value_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 1)
                   
         # apply position embeddings after key_states are stored in prefix cache       
         cos, sin = position_embeddings
@@ -108,6 +107,8 @@ class LlamaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        print("key_states shape:", key_states.shape)
+        print("value_states shape:", value_states.shape)
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -391,7 +392,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings=position_embeddings,
                     **kwargs
                 )
-                print("LlamaModel:forward",prefix_cache_block_ids_list,'\n')
+                # print("LlamaModel:forward",prefix_cache_block_ids_list,'\n')
 
             hidden_states = layer_outputs[0]
 
@@ -699,9 +700,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     ):
         print('prepare_inputs_for_generation')
         # inputs = super().prepare_inputs_for_generation(input_ids, **kwargs)
-        # if past_key_values:
-        #     input_ids = input_ids[:, -1:]
-
+        print("prefix_lengths_list",prefix_lengths_list)
+        if prefix_lengths_list is not None and prefix_lengths_list[0] > 0:
+            input_ids = input_ids[:, -1:]
+        print("input_ids",input_ids)
+        # print("the length of input_ids ",len(input_ids))
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
@@ -740,6 +743,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         
         # self._my_custom_prefix_args = prefix_args
         print("LlamaForCausalLM:generate",self._my_custom_prefix_args,'\n')
+        generate_kwargs.update(self._my_custom_prefix_args)
         return super().generate(input_ids, **generate_kwargs)
     
 class MyLlamaForCausalLM(LlamaForCausalLM):  

@@ -129,7 +129,7 @@ class CacheEngine:
 
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
-            self.num_gpu_blocks, torch.device("cuda:1"))
+            self.num_gpu_blocks, torch.device("cuda:0"))
         # self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
 
     '''
