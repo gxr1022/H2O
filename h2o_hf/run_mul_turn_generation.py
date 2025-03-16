@@ -139,7 +139,7 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
         
         input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
 
-        print("full_cache_generation",input_ids,'\n')
+        # print("full_cache_generation",input_ids,'\n')
         result = scheduler.generate(model, tokenizer, input_ids, max_new_tokens=length)
 
         # generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)

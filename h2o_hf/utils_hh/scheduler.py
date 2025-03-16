@@ -74,13 +74,14 @@ class PrefixCacheScheduler:
         print("prefix_cache_block_ids_list:",prefix_cache_block_ids_list,'\n')
          
         generate_kwargs = {
-        "max_new_tokens": 128,
+        "max_new_tokens": 1,
         "use_cache": False,
         "prefix_cache_block_ids_list": prefix_cache_block_ids_list,
         "new_kv_cache_positions": new_kv_cache_positions,
         "prefix_lengths_list": prefix_lengths_list
     }    
         generate_ids = model.generate(input_ids, **generate_kwargs)
+        print("Generated IDs:", generate_ids)
         result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         
      

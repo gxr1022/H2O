@@ -61,13 +61,18 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         
-        # print("LlamaAttention:forward",input_shape)
-        
         # （bsz, seq_len, num_heads, head_dim）
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
+        # if(self.layer_idx == 0):
+        #     print("hidden_states",hidden_states)
+        #     print("hidden_shape",hidden_shape)
+            # print("query_states",query_states.shape)
+            # print("query_states[0, :, :, :]",query_states[0, :, :, :])
+            # print("key_states[0, :, -1, :]",key_states[0, :, -1, :])
+            # print("key_states.shape",key_states.shape)
+ 
         # append KV to prefix cache.
         # batch_size = len(prefix_cache_block_ids_list)
         # for b in range(batch_size):
@@ -83,19 +88,14 @@ class LlamaAttention(nn.Module):
         #     prefix_lengths_list[b] = prefix_lengths_list[b] + 1
         #     print("prefix_lengths_list",prefix_lengths_list)
             
-        # print("new_kv_cache_positions",new_kv_cache_positions)
-        # # assert batch_size == 1
-        # key_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 0)
-        # value_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 1)
-                  
+
+    
         # apply position embeddings after key_states are stored in prefix cache       
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # if past_key_value is not None:
-        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
-        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        # if(self.layer_idx == 0):
+        #     print("key_states[0, :, -1, :]",key_states[0, :, -1, :])
+        #     print("key_states[0, :, -1, :] shape:",key_states[0, :, -1, :].shape)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -107,8 +107,8 @@ class LlamaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        print("key_states shape:", key_states.shape)
-        print("value_states shape:", value_states.shape)
+        # print("key_states shape:", key_states.shape)
+        # print("value_states shape:", value_states.shape)
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -347,13 +347,14 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
+        print("input_ids",input_ids)
+        print("inputs_embeds",inputs_embeds)
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_seen_tokens, output_attentions
         )
 
         hidden_states = inputs_embeds
-        print("hidden_states:",hidden_states,'\n')
+        # print("hidden_states:",hidden_states,'\n')
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -703,8 +704,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         print("prefix_lengths_list",prefix_lengths_list)
         if prefix_lengths_list is not None and prefix_lengths_list[0] > 0:
             input_ids = input_ids[:, -1:]
-        print("input_ids",input_ids)
-        # print("the length of input_ids ",len(input_ids))
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
