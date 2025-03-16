@@ -117,7 +117,7 @@ def format_conversation(conversations, current_turn):
 
 def  full_cache_generation(model_name, cache_dir, tokenizer, length):
     conversation_id = '1jjEIai'
-    conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
+    conversations, num_turns = load_conversation_from_sharedgpt('/home/gxr1/H2O/sharegpt_gpt4.json', conversation_id)
     prompt_text = ''
     # model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
     
@@ -129,6 +129,8 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
         enable_prefix_caching=True
     )
     
+    
+     
     model = MyLlamaForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
     model.half().eval().cuda()
     
@@ -139,7 +141,7 @@ def  full_cache_generation(model_name, cache_dir, tokenizer, length):
         
         input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
 
-        print("full_cache_generation",input_ids,'\n')
+        # print("full_cache_generation",input_ids,'\n')
         result = scheduler.generate(model, tokenizer, input_ids, max_new_tokens=length)
 
         # generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)
@@ -191,7 +193,7 @@ def  heavy_hitter_generation_with_gpt_resp(model_name,model_arch, cache_dir, tok
 
 def  heavy_hitter_generation(model_name,model_arch, cache_dir, tokenizer, length,config):
     conversation_id = '1jjEIai'
-    conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
+    conversations, num_turns = load_conversation_from_sharedgpt('/home/gxr1/H2O/sharegpt_gpt4.json', conversation_id)
     prompt_text = ''
     for i in range(0,num_turns,2):
         prompt_text += format_conversation(conversations, i)
@@ -215,7 +217,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--model_arch", type=str, default='llama')
-    parser.add_argument("--model_name", type=str, default='/data/home/public/weight/llama2-7b-chat')
+    parser.add_argument("--model_name", type=str, default='/data1/models/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9')
     parser.add_argument("--cache_dir", type=str, default='../../checkpoint/')
 
     parser.add_argument("--heavy_ratio", type=float, default=0.1)

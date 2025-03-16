@@ -113,6 +113,7 @@ class CacheEngine:
         self.num_kv_heads = model_config.num_attention_heads
         self.head_size = model_config.hidden_size // self.num_kv_heads
 
+        
         self.num_attention_layers = model_config.num_hidden_layers
         
         self.block_size = cache_config.block_size
@@ -129,12 +130,12 @@ class CacheEngine:
 
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
-            self.num_gpu_blocks, torch.device("cuda:1"))
+            self.num_gpu_blocks, torch.device("cuda:0"))
         # self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
 
     '''
     # 访问第一层的 key cache 中第3个块的第2个token的第1个头
-    layer_0_key = kv_cache[0][0, 3, 2, 1, :]
+    layer_0_key = kv_cache[0][3, 2, 1, :]
     '''
     def _allocate_kv_cache(
         self,
@@ -143,7 +144,8 @@ class CacheEngine:
     ) -> List[torch.Tensor]:
 
         """Allocates KV cache on the specified device."""
-        kv_cache_shape = (2,num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+        # kv_cache_shape = (2,num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+        kv_cache_shape = (2, num_blocks, self.num_kv_heads, self.block_size, self.head_size)
         print("CacheEngine:_allocate_kv_cache",kv_cache_shape)
         kv_cache: List[torch.Tensor] = []
 
@@ -156,6 +158,7 @@ class CacheEngine:
                                          device=device)
 
             kv_cache.append(layer_kv_cache.view(kv_cache_shape))
+            # print("layer_kv_cache",layer_kv_cache.shape)
         return kv_cache
 
     # def swap_in(self, src_to_dst: torch.Tensor) -> None:
@@ -208,120 +211,109 @@ class CacheEngine:
         value_cache_entry = key_cache_entry 
 
         # ?? Why num_attention_layers need to be multiplied?
+        # Because every layer has a kv cache, and the number of gpu blocks is the same for all layers, so we need to multiply the number of layers
         total = num_attention_layers * cache_config.block_size * (key_cache_entry + value_cache_entry)
 
         dtype_size = get_dtype_size(dtype)
         return dtype_size * total
 
-    # def get_cached_kvs(self, block_ids: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    def append_kv(
+    self,
+    block_id: int,
+    offset: int,
+    layer_idx: int,
+    key_states: torch.Tensor,   # (num_head, seq_len, head_dim)
+    value_states: torch.Tensor  # (num_head, seq_len, head_dim)
+) -> Tuple[int, int, int]:
+        """
+        将 (num_head, seq_len, head_dim) 形状的 key/value states 写入到
+        (2, block_id, num_head, block_size, head_dim) 的缓存中, 支持部分填充：
 
-    def append_kv(self, block_id:int, offset:int, layer_idx:int, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
-        if offset >= self.block_size:
-            block_id += 1
-            offset = 0
-            new_allocated_blocks = 1
-        else:
-            new_allocated_blocks = 0
-        self.gpu_cache[layer_idx][0, block_id, offset, :, :] = key_states
-        self.gpu_cache[layer_idx][1, block_id, offset, :, :] = value_states
-        return new_allocated_blocks
-        
-    def get_cached_kv(self, block_ids: List[int], layer_idx: int, offset: int, key:int):
+        - 当当前 block 剩余空间不足时，会先填满这一 block
+        - 剩下的内容挪到下一个 block 继续写，必要时可连续分配多个 block
+
+        参数:
+            block_id (int):        当前可用的 block id
+            offset (int):         当前 block 尚未写入的起始位置
+            layer_idx (int):      指定写入第几层
+            key_states (Tensor):  (num_head, seq_len, head_dim)
+            value_states (Tensor):(num_head, seq_len, head_dim)
+
+        返回值:
+            (final_block_id, final_offset, blocks_allocated)
+                final_block_id:   写完后最终所在的 block
+                final_offset:     写完后在该 block 的 offset
+                blocks_allocated: 在写入过程中新增分配了多少个 block
+        """
+        seq_len = key_states.size(1)
+        total_tokens_to_place = seq_len
+        start_idx = 0
+
+        blocks_allocated = 0
+        final_block_id = block_id
+        final_offset = offset
+
+        while total_tokens_to_place > 0:
+            leftover = self.block_size - final_offset
+            tokens_to_fill = min(leftover, total_tokens_to_place)
+           
+            self.gpu_cache[layer_idx][0, final_block_id, :, final_offset : final_offset + tokens_to_fill, :] = (
+                key_states[:, start_idx : start_idx + tokens_to_fill, :]
+            )
+            self.gpu_cache[layer_idx][1, final_block_id, :, final_offset : final_offset + tokens_to_fill, :] = (
+                value_states[:, start_idx : start_idx + tokens_to_fill, :]
+            )
+
+            final_offset += tokens_to_fill
+            start_idx += tokens_to_fill
+            total_tokens_to_place -= tokens_to_fill
+
+            if final_offset == self.block_size and total_tokens_to_place > 0:
+                final_block_id += 1
+                final_offset = 0
+                blocks_allocated += 1
+
+        return final_block_id, final_offset, blocks_allocated
+
+    def get_cached_kv(self, block_ids: List[int], layer_idx: int,block_id: int, offset: int, key: int):
+
         if not block_ids:
             return None
-        
-        total_len = (len(block_ids) - 1) * self.block_size + offset
-        
-        # 使用index_select一次性选择所需的数据
-        indices = torch.arange(
-            block_ids[0] * self.block_size,
-            (block_ids[-1]) * self.block_size + offset,
-            device=self.gpu_cache[layer_idx].device
+        # if(layer_idx == 0 and key == 0):
+        #     print("block_ids",block_ids)
+        #     print("offset",offset)
+        start_block = 0
+        end_block   = block_id 
+
+        start_pos = 0
+        end_pos   = (end_block) * self.block_size + offset  
+        length    = end_pos - start_pos                   
+
+        # 1) 先“view”成 [num_kv_heads, total_length, head_size]
+        #    注意：要确保 self.gpu_cache[layer_idx][key] 的形状能被这样整除
+        reshaped = self.gpu_cache[layer_idx][key][0:end_block+1, :, :, :].permute(1, 0, 2, 3).contiguous().view(
+            self.num_kv_heads,
+            -1,               
+            self.head_size
         )
-        return self.gpu_cache[layer_idx][key].reshape(-1, self.num_heads, self.head_dim)[indices].reshape(1, -1, self.num_heads, self.head_dim)
-    
+       
 
-# class TokenIdCache:
+        sliced_view = reshaped.narrow(dim=1, start=start_pos, length=length)
+        # if(layer_idx == 0):
+        #     print("self.gpu_cache[layer_idx][key][end_block, :, :, :]",self.gpu_cache[layer_idx][key][end_block, :, :, :])
+        #     print("reshaped",reshaped)
+        #     print("reshaped.shape",reshaped.shape)
+        #     print("sliced_view",sliced_view)
+        #     print("sliced_view.shape",sliced_view.shape)
 
-#     """
-#     Args:
-#         prev_block (Block): The previous block in the sequence.
-#         token_ids (List[int]): The initial token IDs to be stored in the block.
-#         block_size (int): The maximum number of token IDs that can be stored in
-#             the block.
-#         allocator (BlockAllocator): The block allocator associated with this
-#             block.
-#         block_id (Optional[int], optional): The physical block index
-#             of this block. Defaults to None, which means no allocation has been
-#             made.
-#     """
+        
+        final_tensor = sliced_view.unsqueeze(0)
+        # if(layer_idx == 0):
+        #     print("final_tensor[:, -1, :]",final_tensor[:, -1, :])
+        #     print("final_tensor.shape",final_tensor.shape) # 形状: [num_kv_heads, length, head_size]
+        return final_tensor
 
-
-#     def __init__(self, cache_config: CacheConfig, model_config: LlamaConfig):
-#         self.cache_config = cache_config
-#         self.model_config = model_config
-   
-#     def __init__(self,
-#                  prev_block: Optional[Block],
-#                  token_ids: List[int],
-#                  block_size: int,
-#                  allocator: BlockAllocator,
-#                  block_id: Optional[int] = None,
-#                  extra_hash: Optional[int] = None):
-#         self._token_ids: List[int] = []
-#         self._block_size = block_size
-#         self._prev_block = prev_block
-#         self._block_id = block_id
-#         self._allocator = allocator
-#         self._append_token_ids(token_ids)
-
-#     def _append_token_ids(self, token_ids: List[int]) -> None:
-#         """Appends the given token IDs to the block
-#         Args:
-#             token_ids (List[int]): The token IDs to be appended to the block.
-#         """
-#         if len(token_ids) == 0:
-#             return
-
-#         assert len(token_ids) <= self.num_empty_slots
-
-#         self._token_ids.extend(token_ids)
-
-#     @property
-#     def block_id(self) -> Optional[int]:
-#         return self._block_id
-
-#     def block_id(self, value: Optional[int]) -> None:
-#         self._block_id = value
-
-#     @property
-#     def is_full(self) -> bool:
-#         return self.num_empty_slots == 0
-
-#     @property
-#     def num_empty_slots(self) -> int:
-#         return self._block_size - len(self.token_ids)
-
-#     @property
-#     def token_ids(self) -> List[int]:
-#         return self._token_ids
-
-#     @property
-#     def num_tokens_total(self) -> int:
-#         raise NotImplementedError(
-#             "num_tokens_total is not used for naive block")
-
-#     @property
-#     def block_size(self) -> int:
-#         return self._block_size
-
-#     @property
-#     def prev_block(self) -> Optional["Block"]:
-#         return self._prev_block
-
-
-
-   
 class SessionInfo:
     def __init__(self, session_id: int):
         self.session_id = session_id

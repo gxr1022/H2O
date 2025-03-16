@@ -61,43 +61,76 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         
-        print("LlamaAttention:forward",input_shape)
-        
+         
         # （bsz, seq_len, num_heads, head_dim）
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+
+        # if(self.layer_idx == 0):
+        #     print("hidden_states",hidden_states)
+        #     print ("hidden_shape",hidden_shape)
+            # print("query_states",query_states.shape)
+            # print("query_states[0, :, :, :]",query_states[0, :, :, :])
+            # print("before apply_rotary_pos_emb key_states[0, :, -1, :]",key_states[0, :, -1, :])
+            # print("before apply_rotary_pos_emb key_states.shape",key_states.shape)
+
+
+        cos, sin = position_embeddings
+        # if(self.layer_idx == 0):
+        #     print("sin",sin.shape)
+        #     print("cos",cos.shape)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        # if(self.layer_idx == 0):
+            # print("hidden_states",hidden_states)
+            # print ("hidden_shape",hidden_shape)
+            # print("query_states",query_states.shape)
+            # print("query_states[0, :, :, :]",query_states[0, :, :, :])
+            # print("after apply_rotary_pos_emb key_states[0, :, -1, :]",key_states[0, :, -1, :])
+            # print("after apply_rotary_pos_emb key_states.shape",key_states.shape)
+
+
         # append KV to prefix cache.
-        # if prefix_cache_block_ids_list is not None:
         batch_size = len(prefix_cache_block_ids_list)
         for b in range(batch_size):
             if new_kv_cache_positions[b] is not None:
                 block_id, offset = new_kv_cache_positions[b]
-                new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
-                if new_allocated_block == 1:
-                    new_kv_cache_positions[b] = (block_id + 1, 0)
-                    prefix_cache_block_ids_list[b].append(block_id + 1)
+                # (bsz, num_head, seq_len, head_dim)
+                if self.layer_idx == self.config.num_hidden_layers - 1:
+                    new_block_id, new_offset, new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
+                    if new_allocated_block > 0:
+                        new_kv_cache_positions[b] = [new_block_id, new_offset]
+                        prefix_cache_block_ids_list[b].extend(range(new_block_id - new_allocated_block + 1, new_block_id + 1))
+                    else:
+                        new_kv_cache_positions[b][1] = new_offset
+                    block_id_extend_layers = block_id
+                    offset_extend_layers = offset
+                    prefix_lengths_list[b] = prefix_lengths_list[b] + key_states.shape[2] 
+                    prefix_key_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 0)
+                    prefix_value_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 1)
                 else:
-                    new_kv_cache_positions[b].offset += 1
-            
-            prefix_lengths_list[b] = prefix_lengths_list[b] + 1
-            print("prefix_lengths_list",prefix_lengths_list)
-            
-        print("new_kv_cache_positions",new_kv_cache_positions)
-        # assert batch_size == 1
-        key_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 0)
-        value_states[0] = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx, new_kv_cache_positions[0].offset, 1)
-                  
-        # apply position embeddings after key_states are stored in prefix cache       
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                    new_block_id, new_offset, new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
+                    prefix_key_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 0)
+                    prefix_value_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 1)
 
+
+                     
+                    
+                    
+        
         # if past_key_value is not None:
         #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
         #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
+        
+        # if(self.layer_idx == 0):
+        #     print("prefix_key_states",prefix_key_states)
+        #     print("prefix_value_states",prefix_value_states)
+        #     print("prefix_key_states.shape",prefix_key_states.shape)
+        #     print("prefix_value_states.shape",prefix_value_states.shape)
+        
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
@@ -108,19 +141,39 @@ class LlamaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        # print(f"Layer {self.layer_idx}: attention_mask sum {attention_mask.sum().item()}")
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
-            key_states,
-            value_states,
+            prefix_key_states,
+            prefix_value_states,
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             **kwargs,
         )
+        
+        if(self.layer_idx == 0):
+            # print("LlamaAttention: 0 attn_output",attn_output)
+            print("LlamaAttention: 0 prefix_key_states",prefix_key_states)
+            print("LlamaAttention: 0 prefix_value_states",prefix_value_states)
+            # print("LlamaAttention: 0 attention_mask",attention_mask)
+            # print("LlamaAttention: 0 query_states",query_states)
+        if(self.layer_idx == 1):
+            # print("LlamaAttention: 1 attn_output",attn_output)
+            print("LlamaAttention: 1 prefix_key_states",prefix_key_states)
+            print("LlamaAttention: 1 prefix_value_states",prefix_value_states)
+            # print("LlamaAttention: 1 attention_mask",attention_mask)
+            # print("LlamaAttention: 1 query_states",query_states)
+        # if(self.layer_idx == 1):
+            # print("LlamaAttention: 1 key_states",key_states)
+            # print("LlamaAttention: 1 value_states",value_states) 
 
+        # print(f"attn_output shape before projection: {attn_output.shape}")
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        # print(f"attn_output shape before projection:", attn_output)
         attn_output = self.o_proj(attn_output)
+        # print(f"attn_output shape after projection:", attn_output)
         return attn_output, attn_weights
 
 class LlamaDecoderLayer(nn.Module):
@@ -179,7 +232,7 @@ class LlamaDecoderLayer(nn.Module):
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
-
+        # print("LlamaDecoderLayer:forward outputs",outputs)
         return outputs
 
 
@@ -335,6 +388,8 @@ class LlamaModel(LlamaPreTrainedModel):
                 past_seen_tokens = prefix_lengths_list[0]  
         else:
                 past_seen_tokens = 0
+                
+        print("LlamaModel:forward past_seen_tokens",past_seen_tokens)
 
         if cache_position is None: 
             cache_position = torch.arange(
@@ -344,18 +399,23 @@ class LlamaModel(LlamaPreTrainedModel):
             )
             
 
+        # print("LlamaModel:forward position_ids",position_ids)
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
+        # print("LlamaModel:forward input_ids",input_ids)
+        # print("LlamaModel:forward inputs_embeds",inputs_embeds)
 
         causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_seen_tokens, output_attentions
+            attention_mask, inputs_embeds, prefix_lengths_list, past_seen_tokens, output_attentions
         )
 
         hidden_states = inputs_embeds
-        print("hidden_states:",hidden_states,'\n')
+        # print("LlamaModelLlamaModel:forward hidden_states:",hidden_states,'\n')
+
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
+        # print(":forward position_embeddings",position_embeddings)
+        
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -391,7 +451,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings=position_embeddings,
                     **kwargs
                 )
-                print("LlamaModel:forward",prefix_cache_block_ids_list,'\n')
+                # print("LlamaModel:forward",prefix_cache_block_ids_list,'\n')
 
             hidden_states = layer_outputs[0]
 
@@ -416,8 +476,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self,
         attention_mask: torch.Tensor,
         input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        # past_key_values: Cache,
+        prefix_lengths_list: List[int],
         past_seen_tokens: int,
         output_attentions: bool,
     ):
@@ -454,16 +513,19 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        # print(f"Before LlamaAttention: attention_mask sum = {attention_mask.sum()}, shape = {attention_mask.shape}")
+
         causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
             attention_mask,
             sequence_length=sequence_length,
             target_length=target_length,
             dtype=dtype,
             device=device,
-            cache_position=cache_position,
+            prefix_lengths_list=prefix_lengths_list,
             batch_size=input_tensor.shape[0],
         )
-
+        # print("LlamaAttention: causal_mask",causal_mask)
+        # print(f"After LlamaAttention: causal_mask sum = {causal_mask.sum()}, shape = {causal_mask.shape}")
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
@@ -485,7 +547,7 @@ class LlamaModel(LlamaPreTrainedModel):
         target_length: int,
         dtype: torch.dtype,
         device: torch.device,
-        cache_position: torch.Tensor,
+        prefix_lengths_list: List[int],
         batch_size: int,
         **kwargs,
     ):
@@ -521,7 +583,11 @@ class LlamaModel(LlamaPreTrainedModel):
             )
             if sequence_length != 1:
                 causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            
+            prefix_lengths_tensor = torch.tensor(prefix_lengths_list, device=device).reshape(-1, 1)  # (batch_size, 1)
+            # print("prefix_lengths_tensor",prefix_lengths_tensor)
+            causal_mask *= torch.arange(target_length, device=device) > prefix_lengths_tensor
+            
             causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
             if attention_mask is not None:
                 causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
@@ -533,7 +599,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                     padding_mask, min_dtype
                 )
-
+            # print("causal_mask",causal_mask)
         return causal_mask
 
 class LlamaForCausalLM(LlamaPreTrainedModel):
@@ -697,17 +763,19 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, 
         prefix_cache_block_ids_list=None, new_kv_cache_positions=None, prefix_lengths_list=None, **kwargs
     ):
-        print('prepare_inputs_for_generation')
+        # print('prepare_inputs_for_generation')
         # inputs = super().prepare_inputs_for_generation(input_ids, **kwargs)
-        # if past_key_values:
-        #     input_ids = input_ids[:, -1:]
 
+        # print("prefix_lengths_list",prefix_lengths_list)
+        if prefix_lengths_list is not None and prefix_lengths_list[0] > 0:
+            input_ids = input_ids[:, -1:]
+        # print("input_ids",input_ids)
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
+            if prefix_lengths_list is not None and prefix_lengths_list[0] > 0:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
@@ -739,7 +807,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         
         # self._my_custom_prefix_args = prefix_args
-        print("LlamaForCausalLM:generate",self._my_custom_prefix_args,'\n')
+        # print("LlamaForCausalLM:generate",self._my_custom_prefix_args,'\n')
+        generate_kwargs.update(self._my_custom_prefix_args)
         return super().generate(input_ids, **generate_kwargs)
     
 class MyLlamaForCausalLM(LlamaForCausalLM):  
@@ -785,7 +854,7 @@ class MyLlamaForCausalLM(LlamaForCausalLM):
 
         return new_obj    
 
-    def generate(self, input_ids, **generate_kwargs):
+    def generate(self, input_ids, attention_mask=None, **generate_kwargs):
         """
         1. 先剥离 `prefix_cache_block_ids_list` 等参数，存储到 self._my_custom_prefix_args
         2. 调用 `super().generate(...)` 来执行生成逻辑
@@ -801,7 +870,7 @@ class MyLlamaForCausalLM(LlamaForCausalLM):
         
         self.inner_model._my_custom_prefix_args = prefix_args
         
-        return self.inner_model.generate(input_ids, **generate_kwargs)
+        return self.inner_model.generate(input_ids,attention_mask=attention_mask,**generate_kwargs)
 
     def _validate_model_kwargs(self, model_kwargs):
         """
@@ -815,11 +884,11 @@ class MyLlamaForCausalLM(LlamaForCausalLM):
         # ✅ 调用 inner_model 的 `_validate_model_kwargs` 进行检查
         self.inner_model._validate_model_kwargs(model_kwargs)
 
-    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
         """
         确保在 `prepare_inputs_for_generation` 里能够正确注入自定义前缀缓存参数
         """
-        model_inputs = self.inner_model.prepare_inputs_for_generation(input_ids, **kwargs)
+        model_inputs = self.inner_model.prepare_inputs_for_generation(input_ids, attention_mask=attention_mask, **kwargs)
 
         if hasattr(self, "_my_custom_prefix_args"):
             for k, v in self._my_custom_prefix_args.items():
