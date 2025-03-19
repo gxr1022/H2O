@@ -5,16 +5,16 @@ from typing import Optional, List
 from torch.nn.utils.rnn import pad_sequence
 
 class PrefixCacheScheduler:
-    def __init__(self, model: LlamaForCausalLM, cache_config: CacheConfig):
-        self.model = model
-        self.session_kv_cache = SessionKVCache(cache_config, model.config)
+    def __init__(self, model_config: dict, cache_config: CacheConfig):
+        self.model_config = model_config
+        self.session_kv_cache = SessionKVCache(cache_config, model_config)
         # self.cache_engine = model.cache_engine
         self.cache_config = cache_config
-
+        
     def deal_with_prefix_cache(self,input_ids=None,attention_mask=None):
         # match prefix cache
         batch_size = input_ids.shape[0]
-        print("deal_with_prefix_cache:input_ids",input_ids)
+        # print("deal_with_prefix_cache:input_ids",input_ids)
         # layer_num = self.model.config.num_hidden_layers
         
         if self.cache_config and self.cache_config.enable_prefix_caching:
@@ -24,24 +24,27 @@ class PrefixCacheScheduler:
 
             for batch_idx in range(batch_size):
                 sequence = input_ids[batch_idx]  
-                if self.session_kv_cache.sessions != []:
-                    matching_session = self.session_kv_cache.find_matching_session(sequence.tolist())
-                    if matching_session:
-                        cached_blocks = matching_session.block_ids
-                        prefix_cache_block_ids_list[batch_idx] = cached_blocks
-                        match_length = matching_session.compute_match_length(sequence.tolist())
-                        new_tokens = sequence[match_length:]
-                        prefix_lengths_list[batch_idx] = match_length #The token length of the matching session
-                    else:
-                        new_tokens = sequence 
-                        # prefix_cache_block_ids_list[batch_idx] = []
-                        prefix_lengths_list[batch_idx] = 0
-
-                    new_input_ids_list.append(new_tokens)
-                    input_ids = pad_sequence(new_input_ids_list, batch_first=True, padding_value=0)
+                matching_session, ss_token_ids, token_ids = self.session_kv_cache.find_matching_session(sequence.tolist())
+                print("matching_session",matching_session)
+                print("self.session_kv_cache.sessions",self.session_kv_cache.sessions)
+                if matching_session:
+                    cached_blocks = matching_session.block_ids
+                    prefix_cache_block_ids_list[batch_idx] = cached_blocks
+                    match_length = matching_session.compute_match_length(sequence.tolist())
+                    new_tokens = sequence[match_length:]
+                    prefix_lengths_list[batch_idx] = match_length #The token length of the matching session
                 else:
-                    matching_session = self.session_kv_cache.create_new_session(sequence.tolist(), []) 
-                    new_input_ids_list.append(sequence)
+                    new_tokens = sequence 
+                    # prefix_cache_block_ids_list[batch_idx] = []
+                    prefix_lengths_list[batch_idx] = 0
+                    matching_session = self.session_kv_cache.create_new_session()
+
+                new_input_ids_list.append(new_tokens)
+                input_ids = pad_sequence(new_input_ids_list, batch_first=True, padding_value=0)
+            # else:
+                #     matching_session = self.session_kv_cache.create_new_session(sequence.tolist(), []) 
+                #     new_input_ids_list.append(sequence)
+
             # calculated new KV cache positions 
             new_kv_cache_positions = [None for _ in range(batch_size)]
 
@@ -53,8 +56,9 @@ class PrefixCacheScheduler:
                 else:
                     new_kv_cache_positions[b] = [0,0]
 
-            # print("new_input_ids_list",new_input_ids_list) 
-            # print("prefix_lengths_list",prefix_lengths_list)
+            print("new_input_ids_list",new_input_ids_list) 
+            print("prefix_lengths_list",prefix_lengths_list)
+            print("prefix_cache_block_ids_list",prefix_cache_block_ids_list)
             # deal with attention mask
    
             attention_mask = self._adjust_attention_mask(
@@ -62,7 +66,7 @@ class PrefixCacheScheduler:
                 prefix_lengths=prefix_lengths_list,
                 new_input_ids_list=new_input_ids_list
             )
-            return attention_mask, prefix_cache_block_ids_list, new_kv_cache_positions, prefix_lengths_list
+            return attention_mask, prefix_cache_block_ids_list, new_kv_cache_positions, prefix_lengths_list, matching_session,ss_token_ids, token_ids
         
     def generate(
         self,
@@ -77,21 +81,22 @@ class PrefixCacheScheduler:
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
         
-        attention_mask, prefix_cache_block_ids_list, new_kv_cache_positions, prefix_lengths_list = self.deal_with_prefix_cache(input_ids=input_ids,attention_mask=attention_mask)
-        print(f"generate: attention_mask sum {attention_mask.sum().item()}")
+        attention_mask, prefix_cache_block_ids_list, new_kv_cache_positions, prefix_lengths_list, matching_session,ss_token_ids, token_ids = self.deal_with_prefix_cache(input_ids=input_ids,attention_mask=attention_mask)
          
         generate_kwargs = {
-        "max_new_tokens": 2,
+        "max_new_tokens": 1024,
         "use_cache": False,
         "prefix_cache_block_ids_list": prefix_cache_block_ids_list,
         "new_kv_cache_positions": new_kv_cache_positions,
-        "prefix_lengths_list": prefix_lengths_list
+        "prefix_lengths_list": prefix_lengths_list,
+        "matching_session": matching_session
     }    
+        if ss_token_ids is not None:
+            print("ss_token_ids",tokenizer.convert_ids_to_tokens(ss_token_ids))
+            print("token_ids",tokenizer.convert_ids_to_tokens(token_ids))
         generate_ids = model.generate(input_ids, attention_mask=attention_mask, **generate_kwargs)
-        # print("Generated IDs:", generate_ids)
         result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         
-     
         return result
 
     def _adjust_attention_mask(

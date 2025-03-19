@@ -16,16 +16,20 @@ from utils_hh.prefix_cache import CacheConfig, SessionKVCache, SessionInfo, Cach
 
 
 logger = logging.getLogger(__name__)
-_CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
+_CHECKPOINT_FOR_DOC = "meta-llama/Llama-3.1-8B-Instruct"
 _CONFIG_FOR_DOC = "LlamaConfig"
+
+
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int, cache_engine: CacheEngine):
+    def __init__(self, config: LlamaConfig, layer_idx: int, cache_engine: CacheEngine, cur_round: int, round_info:Dict[str, Any]):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.cur_round = cur_round
+        self.round_info = round_info
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
@@ -56,6 +60,7 @@ class LlamaAttention(nn.Module):
         new_kv_cache_positions: Optional[List[Tuple[int, int]]] = None,
         prefix_lengths_list: Optional[List[int]] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        matching_session: Optional[SessionInfo] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
@@ -67,30 +72,8 @@ class LlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-
-        # if(self.layer_idx == 0):
-        #     print("hidden_states",hidden_states)
-        #     print ("hidden_shape",hidden_shape)
-            # print("query_states",query_states.shape)
-            # print("query_states[0, :, :, :]",query_states[0, :, :, :])
-            # print("before apply_rotary_pos_emb key_states[0, :, -1, :]",key_states[0, :, -1, :])
-            # print("before apply_rotary_pos_emb key_states.shape",key_states.shape)
-
-
         cos, sin = position_embeddings
-        # if(self.layer_idx == 0):
-        #     print("sin",sin.shape)
-        #     print("cos",cos.shape)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        
-        # if(self.layer_idx == 0):
-            # print("hidden_states",hidden_states)
-            # print ("hidden_shape",hidden_shape)
-            # print("query_states",query_states.shape)
-            # print("query_states[0, :, :, :]",query_states[0, :, :, :])
-            # print("after apply_rotary_pos_emb key_states[0, :, -1, :]",key_states[0, :, -1, :])
-            # print("after apply_rotary_pos_emb key_states.shape",key_states.shape)
-
 
         # append KV to prefix cache.
         batch_size = len(prefix_cache_block_ids_list)
@@ -115,22 +98,48 @@ class LlamaAttention(nn.Module):
                     prefix_key_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 0)
                     prefix_value_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 1)
 
+                # update matched session
+                if(self.layer_idx == 0):
+                    matching_session.block_ids.extend(range(block_id + 1, new_block_id + 1))
+                    # print("cur_round",self.cur_round)
+                    # print("prefix_cache_block_ids_list",prefix_cache_block_ids_list)
+                    # print("matching_session.block_ids",matching_session.block_ids)
+                
+                # create round metadata
+                prefill_length = key_states.shape[2]
+                if(prefill_length > 1):
+                    self.cur_round += 1
+                if(self.layer_idx == 0):
+                    if (prefill_length > 1): # prefill phase 左闭右开
+                        self.round_info[self.cur_round] = {}
+                        self.round_info[self.cur_round]["user"] = {"start":(None,None), "end":(None,None)}
+                        self.round_info[self.cur_round]["system"] = {"start":(None,None), "end":(None,None)}
+                        self.round_info[self.cur_round]["user"]["start"] = (block_id, offset)
+                        self.round_info[self.cur_round]["user"]["end"] = (new_block_id, new_offset)
+                        self.round_info[self.cur_round]["system"]["start"] = (new_block_id, new_offset)
+                        if(self.cur_round > 0):
+                            self.round_info[self.cur_round-1]["system"]["end"] = (block_id, offset)
+                
 
-                     
-                    
-                    
-        
-        # if past_key_value is not None:
-        #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
-        #     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
+        # sparse attention
         # if(self.layer_idx == 0):
-        #     print("prefix_key_states",prefix_key_states)
-        #     print("prefix_value_states",prefix_value_states)
-        #     print("prefix_key_states.shape",prefix_key_states.shape)
-        #     print("prefix_value_states.shape",prefix_value_states.shape)
-        
+        # print("self.cur_round",self.cur_round)
+        for r_idx in range(self.cur_round-1):
+            user_start_block_id, user_start_offset = self.round_info[r_idx]["user"]["start"]
+            user_end_block_id, user_end_offset = self.round_info[r_idx]["user"]["end"]
+            system_start_block_id, system_start_offset = self.round_info[r_idx]["system"]["start"]
+            system_end_block_id, system_end_offset = self.round_info[r_idx]["system"]["end"]
+            # print(self.layer_idx, r_idx)
+            # print(self.layer_idx, user_start_block_id, user_start_offset, user_end_block_id, user_end_offset)
+            # print(self.layer_idx, system_start_block_id, system_start_offset, system_end_block_id, system_end_offset)
+            round_user_key_states = self.cache_engine.get_key_cache_from_pos(self.layer_idx, user_start_block_id, user_start_offset, user_end_block_id, user_end_offset)
+            round_system_key_states = self.cache_engine.get_key_cache_from_pos(self.layer_idx, system_start_block_id, system_start_offset, system_end_block_id, system_end_offset)
+            if(self.layer_idx == 0):
+                print(user_start_block_id, user_start_offset, user_end_block_id, user_end_offset)
+                print(system_start_block_id, system_start_offset, system_end_block_id, system_end_offset)
+
+               
+                
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
@@ -141,7 +150,7 @@ class LlamaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # print(f"Layer {self.layer_idx}: attention_mask sum {attention_mask.sum().item()}")
+        # full attention
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -153,35 +162,17 @@ class LlamaAttention(nn.Module):
             **kwargs,
         )
         
-        if(self.layer_idx == 0):
-            # print("LlamaAttention: 0 attn_output",attn_output)
-            print("LlamaAttention: 0 prefix_key_states",prefix_key_states)
-            print("LlamaAttention: 0 prefix_value_states",prefix_value_states)
-            # print("LlamaAttention: 0 attention_mask",attention_mask)
-            # print("LlamaAttention: 0 query_states",query_states)
-        if(self.layer_idx == 1):
-            # print("LlamaAttention: 1 attn_output",attn_output)
-            print("LlamaAttention: 1 prefix_key_states",prefix_key_states)
-            print("LlamaAttention: 1 prefix_value_states",prefix_value_states)
-            # print("LlamaAttention: 1 attention_mask",attention_mask)
-            # print("LlamaAttention: 1 query_states",query_states)
-        # if(self.layer_idx == 1):
-            # print("LlamaAttention: 1 key_states",key_states)
-            # print("LlamaAttention: 1 value_states",value_states) 
-
-        # print(f"attn_output shape before projection: {attn_output.shape}")
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        # print(f"attn_output shape before projection:", attn_output)
         attn_output = self.o_proj(attn_output)
-        # print(f"attn_output shape after projection:", attn_output)
         return attn_output, attn_weights
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int, cache_engine: CacheEngine):
+    def __init__(self, config: LlamaConfig, layer_idx: int, cache_engine: CacheEngine, cur_round: int, round_info:Dict[str, Any]):
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx, cache_engine=cache_engine)
+        self.cur_round = cur_round
+        self.round_info = round_info
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx, cache_engine=cache_engine, cur_round=self.cur_round, round_info=self.round_info)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -197,6 +188,7 @@ class LlamaDecoderLayer(nn.Module):
         prefix_cache_block_ids_list: Optional[List[List[int]]] = None,
         new_kv_cache_positions: Optional[List[Tuple[int, int]]] = None,
         prefix_lengths_list: Optional[List[int]] = None,
+        matching_session: Optional[SessionInfo] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
@@ -215,6 +207,7 @@ class LlamaDecoderLayer(nn.Module):
             prefix_cache_block_ids_list=prefix_cache_block_ids_list,
             new_kv_cache_positions=new_kv_cache_positions,
             prefix_lengths_list=prefix_lengths_list,
+            matching_session=matching_session,
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -321,14 +314,15 @@ class LlamaModel(LlamaPreTrainedModel):
         config: LlamaConfig
     """
 
-    def __init__(self, config: LlamaConfig, cache_engine: CacheEngine):
+    def __init__(self, config: LlamaConfig, cache_engine: CacheEngine, cur_round: int, round_info: Dict[str, Any]):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        self.cur_round = cur_round
+        self.round_info = round_info
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx, cache_engine) for layer_idx in range(config.num_hidden_layers)]
+            [LlamaDecoderLayer(config, layer_idx, cache_engine, self.cur_round, self.round_info) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
@@ -353,6 +347,7 @@ class LlamaModel(LlamaPreTrainedModel):
         prefix_cache_block_ids_list: Optional[List[torch.LongTensor]] = None,
         new_kv_cache_positions: Optional[torch.LongTensor] = None,
         prefix_lengths_list: Optional[List[int]] = None,
+        matching_session: Optional[SessionInfo] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -389,7 +384,7 @@ class LlamaModel(LlamaPreTrainedModel):
         else:
                 past_seen_tokens = 0
                 
-        print("LlamaModel:forward past_seen_tokens",past_seen_tokens)
+        # print("LlamaModel:forward past_seen_tokens",past_seen_tokens)
 
         if cache_position is None: 
             cache_position = torch.arange(
@@ -398,6 +393,11 @@ class LlamaModel(LlamaPreTrainedModel):
                 device=inputs_embeds.device
             )
             
+        # update matching session
+        if input_ids is not None:
+            matching_session.token_ids.extend(input_ids.tolist()[0])
+            matching_session.total_tokens += inputs_embeds.shape[1]
+            matching_session.prefix_hash = matching_session._compute_prefix_hash()
 
         # print("LlamaModel:forward position_ids",position_ids)
         if position_ids is None:
@@ -445,6 +445,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     prefix_cache_block_ids_list=prefix_cache_block_ids_list,
                     new_kv_cache_positions=new_kv_cache_positions,
                     prefix_lengths_list=prefix_lengths_list,
+                    matching_session=matching_session,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -619,7 +620,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         self.cache_engine = cache_engine
 
-        self.model = LlamaModel(config, cache_engine)
+        self.model = LlamaModel(config, cache_engine, cur_round=-1, round_info={})
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -656,6 +657,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         prefix_cache_block_ids_list: Optional[List[torch.LongTensor]] = None,
         new_kv_cache_positions: Optional[torch.LongTensor] = None,
         prefix_lengths_list: Optional[List[int]] = None,
+        matching_session: Optional[SessionInfo] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -706,6 +708,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             prefix_cache_block_ids_list=self._my_custom_prefix_args['prefix_cache_block_ids_list'],
             new_kv_cache_positions=self._my_custom_prefix_args['new_kv_cache_positions'],
             prefix_lengths_list=self._my_custom_prefix_args['prefix_lengths_list'],
+            matching_session=self._my_custom_prefix_args['matching_session'],
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -754,14 +757,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         forward_keys.update({
             "prefix_cache_block_ids_list",
             "new_kv_cache_positions",
-            "prefix_lengths_list"
+            "prefix_lengths_list",
+            "matching_session"
         })
         return forward_keys
 
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, 
-        prefix_cache_block_ids_list=None, new_kv_cache_positions=None, prefix_lengths_list=None, **kwargs
+        prefix_cache_block_ids_list=None, new_kv_cache_positions=None, prefix_lengths_list=None, matching_session=None, **kwargs
     ):
         # print('prepare_inputs_for_generation')
         # inputs = super().prepare_inputs_for_generation(input_ids, **kwargs)
@@ -792,6 +796,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             "prefix_cache_block_ids_list": prefix_cache_block_ids_list,
             "new_kv_cache_positions": new_kv_cache_positions,
             "prefix_lengths_list": prefix_lengths_list,
+            "matching_session": matching_session
         })
         return model_inputs
 
@@ -812,17 +817,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         return super().generate(input_ids, **generate_kwargs)
     
 class MyLlamaForCausalLM(LlamaForCausalLM):  
-    """
-    1. 继承 LlamaForCausalLM，但让 inner_model 处理 `_validate_model_kwargs`
-    2. 确保 super().__init__() 先执行，再赋值 inner_model
-    """
-
     def __init__(self, llama_inner_model: LlamaForCausalLM):
-        """
-        初始化时，先调用 super().__init__()，然后再赋值 inner_model。
-        """
         super().__init__(llama_inner_model.config)
-
         self.inner_model = llama_inner_model
         self.cache_engine = llama_inner_model.cache_engine
 
@@ -832,64 +828,40 @@ class MyLlamaForCausalLM(LlamaForCausalLM):
         pretrained_model_name_or_path,
         *model_args,
         cache_engine=None,
+        matched_session=None,
         **kwargs
     ):
-        """
-        1. 先用 LlamaForCausalLM 加载模型
-        2. 确保 `cache_config` 和 `cache_engine` 被正确传递
-        3. 包装成 `MyLlamaForCausalLM` 以处理 `_validate_model_kwargs`
-        """
-
-
-        # 先用 LlamaForCausalLM 的 from_pretrained 加载模型
         llama_model = LlamaForCausalLM.from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             cache_engine=cache_engine,
             **kwargs
         )
-
-        # 再用 MyLlamaForCausalLM 进行包装
         new_obj = cls(llama_inner_model=llama_model)
-
         return new_obj    
 
     def generate(self, input_ids, attention_mask=None, **generate_kwargs):
-        """
-        1. 先剥离 `prefix_cache_block_ids_list` 等参数，存储到 self._my_custom_prefix_args
-        2. 调用 `super().generate(...)` 来执行生成逻辑
-        """
         prefix_args = {}
-        prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list"]
+        prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list", "matching_session"]
         for k in prefix_keys:
             if k in generate_kwargs:
                 prefix_args[k] = generate_kwargs.pop(k)
 
         self._my_custom_prefix_args = prefix_args
-        print("MyLlamaForCausalLM:generate",prefix_args,'\n')
+        # print("MyLlamaForCausalLM:generate",prefix_args,'\n')
         
         self.inner_model._my_custom_prefix_args = prefix_args
         
         return self.inner_model.generate(input_ids,attention_mask=attention_mask,**generate_kwargs)
 
     def _validate_model_kwargs(self, model_kwargs):
-        """
-        由于 Transformers 的 `_validate_model_kwargs` 不识别 `prefix_cache_block_ids_list`
-        这里手动 pop 掉
-        """
-        prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list"]
+        prefix_keys = ["prefix_cache_block_ids_list", "new_kv_cache_positions", "prefix_lengths_list", "matching_session"]
         for k in prefix_keys:
             model_kwargs.pop(k, None)
-
-        # ✅ 调用 inner_model 的 `_validate_model_kwargs` 进行检查
         self.inner_model._validate_model_kwargs(model_kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
-        """
-        确保在 `prepare_inputs_for_generation` 里能够正确注入自定义前缀缓存参数
-        """
         model_inputs = self.inner_model.prepare_inputs_for_generation(input_ids, attention_mask=attention_mask, **kwargs)
-
         if hasattr(self, "_my_custom_prefix_args"):
             for k, v in self._my_custom_prefix_args.items():
                 model_inputs[k] = v

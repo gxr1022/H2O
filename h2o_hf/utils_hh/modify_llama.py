@@ -13,17 +13,162 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-
+import logging
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaModel,LlamaAttention, apply_rotary_pos_emb
+
+from typing import Optional, Tuple, Union, List, Dict, Any, cast, Callable
+from transformers.models.llama.modeling_llama import  LLAMA_START_DOCSTRING,AttentionMaskConverter,LlamaConfig,LlamaMLP,LlamaRMSNorm, LlamaRotaryEmbedding, LlamaPreTrainedModel,apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS,eager_attention_forward
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from torch.nn.utils.rnn import pad_sequence
+
+
+from utils_hh.prefix_cache import CacheConfig, SessionKVCache, SessionInfo, CacheEngine
+
+
+logger = logging.getLogger(__name__)
+_CHECKPOINT_FOR_DOC = "meta-llama/Llama-3.1-8B-Instruct"
+_CONFIG_FOR_DOC = "LlamaConfig"
+
+
 
 __all__ = ['convert_kvcache_llama_heavy_recent', 'LlamaAttention_heavy_hitter']
 
 
+class LlamaAttention_sparse(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: LlamaConfig, layer_idx: int, cache_engine: CacheEngine, cur_round: int, round_info:Dict[str, Any]):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.cur_round = cur_round
+        self.round_info = round_info
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        self.cache_engine = cache_engine
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        prefix_cache_block_ids_list: Optional[List[List[int]]] = None,
+        new_kv_cache_positions: Optional[List[Tuple[int, int]]] = None,
+        prefix_lengths_list: Optional[List[int]] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        
+         
+        # （bsz, seq_len, num_heads, head_dim）
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # append KV to prefix cache.
+        batch_size = len(prefix_cache_block_ids_list)
+        for b in range(batch_size):
+            if new_kv_cache_positions[b] is not None:
+                block_id, offset = new_kv_cache_positions[b]
+                # (bsz, num_head, seq_len, head_dim)
+                if self.layer_idx == self.config.num_hidden_layers - 1:
+                    new_block_id, new_offset, new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
+                    if new_allocated_block > 0:
+                        new_kv_cache_positions[b] = [new_block_id, new_offset]
+                        prefix_cache_block_ids_list[b].extend(range(new_block_id - new_allocated_block + 1, new_block_id + 1))
+                    else:
+                        new_kv_cache_positions[b][1] = new_offset
+                    block_id_extend_layers = block_id
+                    offset_extend_layers = offset
+                    prefix_lengths_list[b] = prefix_lengths_list[b] + key_states.shape[2] 
+                    prefix_key_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 0)
+                    prefix_value_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 1)
+                else:
+                    new_block_id, new_offset, new_allocated_block = self.cache_engine.append_kv(block_id, offset, self.layer_idx, key_states[b, :, :, :], value_states[b, :, :, :])
+                    prefix_key_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 0)
+                    prefix_value_states = self.cache_engine.get_cached_kv(prefix_cache_block_ids_list, self.layer_idx,new_block_id, new_offset, 1)
+
+                # create round metadata
+                if(self.layer_idx == 0):
+                    prefill_length = key_states.shape[2]
+                    if (prefill_length > 1): # prefill phase 左闭右开
+                        self.round_info[self.cur_round] = {}
+                        self.round_info[self.cur_round]["user"] = {}
+                        self.round_info[self.cur_round]["system"] = {}
+                        self.round_info[self.cur_round]["user"].start = (block_id, offset)
+                        self.round_info[self.cur_round]["user"].end = (new_block_id, new_offset)
+                        self.round_info[self.cur_round]["system"].start = (new_block_id, new_offset)
+                        if(self.cur_round >= 0):
+                            self.round_info[self.cur_round-1]["system"].end = (block_id, offset)
+                        self.cur_round += 1
+                        
+                
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                logger.warning_once(
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+
+
+        # sparse attention
+        for r_idx in range(self.cur_round):
+            user_start_block_id, user_start_offset = self.round_info[r_idx]["user"]["start"]
+            user_end_block_id, user_end_offset = self.round_info[r_idx]["user"]["end"]
+            system_start_block_id, system_start_offset = self.round_info[r_idx]["system"]["start"]
+            system_end_block_id, system_end_offset = self.round_info[r_idx]["system"]["end"]
+            
+            round_user_key_states = self.cache_engine.get_key_cache_from_pos(user_start_block_id, user_start_offset, user_end_block_id, user_end_offset)
+            round_system_key_states = self.cache_engine.get_key_cache_from_pos(system_start_block_id, system_start_offset, system_end_block_id, system_end_offset)
+
+            
+            
+                    
+        # full attention
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            prefix_key_states,
+            prefix_value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+        
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
 
 
 class LlamaAttention_heavy_hitter(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig):
         super().__init__()

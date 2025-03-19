@@ -93,6 +93,55 @@ class CacheConfig:
         if self.cache_dtype not in valid_dtypes:
             raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}. Must be one of {valid_dtypes}") 
         
+class SessionInfo:
+    def __init__(self, session_id: int):
+        self.session_id = session_id
+        self.block_ids = []  
+        self.token_ids = []  
+        self.total_tokens = 0
+        self.prefix_hash = None
+       
+        # {round_id: {"user": {"start": (block_id, offset), "end": (block_id, offset)},
+        #                   "system": {"start": (block_id, offset), "end": (block_id, offset)}}}
+    
+    # def add_user_round_kv_cache(self, round_id: int, user_start: tuple, user_end: tuple):
+    #     if round_id not in self.round_info:
+    #         self.round_info[round_id] = {}
+    #     self.round_info[round_id]["user"] = {"start": user_start, "end": user_end}
+
+    # def add_system_round_kv_cache(self, round_id: int, system_start: tuple, system_end: tuple):
+    #     if round_id not in self.round_info:
+    #         self.round_info[round_id] = {}
+    #     self.round_info[round_id]["system"] = {"start": system_start, "end": system_end}
+
+
+
+    def update_session(self, token_ids: List[int], block_ids: List[int]) -> None:
+        """Update session with new tokens and blocks"""
+        self.token_ids.extend(token_ids)
+        self.block_ids.extend(block_ids)
+        self.total_tokens += len(token_ids)
+        self.prefix_hash = self._compute_prefix_hash()
+
+    def _compute_prefix_hash(self) -> str:
+        """Compute hash value for the current token sequence"""
+        return hashlib.md5(str(self.token_ids).encode()).hexdigest()
+
+    def compute_match_length(self, other_tokens: List[int]) -> int:
+        """Calculate matching length with another token sequence"""
+        i = 0
+        while i < len(other_tokens) and i < len(self.token_ids) and other_tokens[i] == self.token_ids[i]:
+            i += 1
+        return i
+
+    def matches_prefix(self, token_ids: List[int]) -> bool:
+        """Check if given tokens match this session's prefix"""
+        target_hash = hashlib.md5(str(token_ids[:len(self.token_ids)]).encode()).hexdigest()
+        print("target_hash",target_hash)
+        print("self.prefix_hash",self.prefix_hash)
+        print(len(self.token_ids),len(token_ids))
+        return target_hash == self.prefix_hash
+
 
 class CacheEngine:
     """Manages the KV cache.
@@ -106,12 +155,12 @@ class CacheEngine:
         self,
         cache_config: CacheConfig,
         model_config: LlamaConfig,
+        
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config
-
-        self.num_kv_heads = model_config.num_attention_heads
-        self.head_size = model_config.hidden_size // self.num_kv_heads
+        self.num_kv_heads = model_config.num_key_value_heads
+        self.head_size = model_config.hidden_size // model_config.num_attention_heads
 
         
         self.num_attention_layers = model_config.num_hidden_layers
@@ -132,6 +181,7 @@ class CacheEngine:
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, torch.device("cuda:0"))
         # self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+        print("CacheEngine:Init")
 
     '''
     # 访问第一层的 key cache 中第3个块的第2个token的第1个头
@@ -273,16 +323,13 @@ class CacheEngine:
                 final_block_id += 1
                 final_offset = 0
                 blocks_allocated += 1
-
         return final_block_id, final_offset, blocks_allocated
 
     def get_cached_kv(self, block_ids: List[int], layer_idx: int,block_id: int, offset: int, key: int):
 
         if not block_ids:
             return None
-        # if(layer_idx == 0 and key == 0):
-        #     print("block_ids",block_ids)
-        #     print("offset",offset)
+        
         start_block = 0
         end_block   = block_id 
 
@@ -298,53 +345,27 @@ class CacheEngine:
             self.head_size
         )
        
-
         sliced_view = reshaped.narrow(dim=1, start=start_pos, length=length)
-        # if(layer_idx == 0):
-        #     print("self.gpu_cache[layer_idx][key][end_block, :, :, :]",self.gpu_cache[layer_idx][key][end_block, :, :, :])
-        #     print("reshaped",reshaped)
-        #     print("reshaped.shape",reshaped.shape)
-        #     print("sliced_view",sliced_view)
-        #     print("sliced_view.shape",sliced_view.shape)
-
-        
         final_tensor = sliced_view.unsqueeze(0)
-        # if(layer_idx == 0):
-        #     print("final_tensor[:, -1, :]",final_tensor[:, -1, :])
-        #     print("final_tensor.shape",final_tensor.shape) # 形状: [num_kv_heads, length, head_size]
         return final_tensor
+    
+    def get_key_cache_from_pos(self, layer_idx: int, start_block: int,  start_offset: int, end_block: int, end_offset: int):
+        
+        start_pos = (start_block) * self.block_size + start_offset  
+        end_pos   = (end_block) * self.block_size + end_offset  
+        length    = end_pos - start_pos                   
 
-class SessionInfo:
-    def __init__(self, session_id: int):
-        self.session_id = session_id
-        self.block_ids = []  # Sequentially stored block ids
-        self.token_ids = []  # Complete token sequence
-        self.total_tokens = 0
-        self.prefix_hash = None
-
-    def update_session(self, token_ids: List[int], block_ids: List[int]) -> None:
-        """Update session with new tokens and blocks"""
-        self.token_ids.extend(token_ids)
-        self.block_ids.extend(block_ids)
-        self.total_tokens += len(token_ids)
-        self.prefix_hash = self._compute_prefix_hash()
-
-    def _compute_prefix_hash(self) -> str:
-        """Compute hash value for the current token sequence"""
-        return hashlib.md5(str(self.token_ids).encode()).hexdigest()
-
-    def compute_match_length(self, other_tokens: List[int]) -> int:
-        """Calculate matching length with another token sequence"""
-        i = 0
-        while i < len(other_tokens) and i < len(self.token_ids) and other_tokens[i] == self.token_ids[i]:
-            i += 1
-        return i
-
-    def matches_prefix(self, token_ids: List[int]) -> bool:
-        """Check if given tokens match this session's prefix"""
-        target_hash = hashlib.md5(str(token_ids[:len(self.token_ids)]).encode()).hexdigest()
-        return target_hash == self.prefix_hash
-
+        reshaped = self.gpu_cache[layer_idx][0][start_block:end_block+1, :, :, :].permute(1, 0, 2, 3).contiguous().view(
+            self.num_kv_heads,
+            -1,               
+            self.head_size
+        )
+       
+        sliced_view = reshaped.narrow(dim=1, start=start_pos, length=length)
+        final_tensor = sliced_view.unsqueeze(0)
+        print("final_tensor.shape",final_tensor.shape)
+        return final_tensor
+        
 class SessionKVCache:
     def __init__(self, cache_config: CacheConfig, model_config: LlamaConfig):
         # self.cache_engine = CacheEngine(cache_config, model_config)
@@ -354,16 +375,22 @@ class SessionKVCache:
         """Find matching session"""
         candidate_sessions = set()
         if len(self.sessions) == 0:
-            return None
+            return None, None, token_ids
         # Filter sessions by hash matching
+        
         for session in self.sessions:
+            print(len(session.token_ids),len(token_ids))
+            print("session.token_ids",session.token_ids)
+
+            print("token_ids",token_ids)
+            return None, session.token_ids, token_ids
             if session.matches_prefix(token_ids):
                 candidate_sessions.add(session)
         
         if len(candidate_sessions) == 0:
-            return None
+            return None, None, token_ids
         elif len(candidate_sessions) == 1:
-            return candidate_sessions.pop()
+            return candidate_sessions.pop(), session.token_ids, token_ids
         else:
             # Find best match among candidates
             best_match = None
@@ -373,13 +400,11 @@ class SessionKVCache:
                 if match_length > max_match_length:
                     max_match_length = match_length
                     best_match = session
-            return best_match
+            return best_match, session.token_ids, token_ids
 
-    def create_new_session(self, token_ids: List[int], block_ids: List[int]) -> SessionInfo:
-        """Create new session"""
+    def create_new_session(self) -> SessionInfo:  # empty session
         session_id = len(self.sessions)
         session = SessionInfo(session_id)
-        session.update_session(token_ids, block_ids)
         self.sessions.append(session) 
         return session
 

@@ -115,81 +115,44 @@ def format_conversation(conversations, current_turn):
     # print(conv)
     return conv['value']
 
-def  full_cache_generation(model_name, cache_dir, tokenizer, length):
+def  full_cache_generation(model_name, config, cache_dir, tokenizer, length):
     conversation_id = '1jjEIai'
-    conversations, num_turns = load_conversation_from_sharedgpt('/home/gxr1/H2O/sharegpt_gpt4.json', conversation_id)
+    conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
     prompt_text = ''
     # model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
-    
+
    
     cache_config = CacheConfig(
-        block_size=1024,
+        block_size=16,
         gpu_memory_utilization=0.9,
         cache_dtype="float16",
         enable_prefix_caching=True
     )
+    cache_engine = CacheEngine(cache_config, config)
     
-    
-     
+    # This is MyLlamaForCausalLM model, which has a inner_model attribute. The inner_model is the original LlamaForCausalLM model.
     model = MyLlamaForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
     model.half().eval().cuda()
     
-    scheduler = PrefixCacheScheduler(model, cache_config)
-    
+    scheduler = PrefixCacheScheduler(config, cache_config)
+    messages = []
+    num_turns = 3
+    result = ''
     for i in range(0,num_turns,2):
-        prompt_text += format_conversation(conversations, i)
-        
-        input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
+        user_prompt = result + format_conversation(conversations, i)
+        # if i == 0:
+        #     messages.append({"role": "system", "content": "You are a helpful multi-turn chatbot."})
+        messages.append({"role": "user", "content": user_prompt})
 
-        # print("full_cache_generation",input_ids,'\n')
-        result = scheduler.generate(model, tokenizer, input_ids, max_new_tokens=length)
+        chat_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
-        # generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)
-        # result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        print(result,'\n')
-        prompt_text += result
-
-    return prompt_text
-
-def  full_cache_generation_with_gpt_resp(model_name, cache_dir, tokenizer, length):
-    conversation_id = '1jjEIai'
-    conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
-    prompt_text = ''
-    for i in range(0,num_turns,2):
-        prompt_text += format_conversation(conversations, i)
-        
-        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
-        model.half().eval().cuda()
-        input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
-
-        generate_ids = model.generate(input_ids, max_new_tokens=length, use_cache=True)
-        result = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        print(result,'\n')
-
-        prompt_text += format_conversation(conversations,i+1)
-    return prompt_text
-
-def  heavy_hitter_generation_with_gpt_resp(model_name,model_arch, cache_dir, tokenizer, length,config):
-    conversation_id = 'xHQuqzG'
-    conversations, num_turns = load_conversation_from_sharedgpt('/data/home/gexr/H2O/sharegpt_gpt4.json', conversation_id)
-    prompt_text = ''
-    for i in range(0,num_turns,2):
-        prompt_text += format_conversation(conversations, i)
-        
-        input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
-        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
-        checkpoint = copy.deepcopy(model.state_dict())
-        model = ENABLE_Heavy_Hitter_FUNCTIONS[model_arch](model, config)
-        model.load_state_dict(checkpoint)
-        model.half().eval().cuda()
-        
-        generate_ids_hh = model.generate(input_ids, max_new_tokens=length, use_cache=True)
-        result_hh = tokenizer.batch_decode(generate_ids_hh, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        
-        print(result_hh)
-        prompt_text += format_conversation(conversations,i+1)
+        input_ids = torch.tensor([chat_prompt]).to(model.inner_model.device)
             
-    return prompt_text
+
+        result = scheduler.generate(model, tokenizer, input_ids, max_new_tokens=length)
+        print("result",result)
+
+    return result
 
 def  heavy_hitter_generation(model_name,model_arch, cache_dir, tokenizer, length,config):
     conversation_id = '1jjEIai'
@@ -217,7 +180,9 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--model_arch", type=str, default='llama')
-    parser.add_argument("--model_name", type=str, default='/data1/models/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9')
+    # parser.add_argument("--model_name", type=str, default='/data/home/public/weight/llama2-7b-chat')
+    # /data/home/gexr/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
+    parser.add_argument("--model_name", type=str, default='/data/home/gexr/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659')
     parser.add_argument("--cache_dir", type=str, default='../../checkpoint/')
 
     parser.add_argument("--heavy_ratio", type=float, default=0.1)
@@ -247,10 +212,11 @@ def main():
     config.recent_ratio = args.recent_ratio
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, cache_dir=args.cache_dir)
+    # print(tokenizer.chat_template)
 
     ######## Generate with Full Cache
-    result = full_cache_generation(model_name, args.cache_dir, tokenizer, args.length)
-    print(result)
+    result = full_cache_generation(model_name, config, args.cache_dir, tokenizer, args.length)
+    # print(result)
     
     ######### Enable HH
     # heavy_hitter_result = heavy_hitter_generation_with_gpt_resp(model_name, args.model_arch, args.cache_dir, tokenizer, args.length, config)
